@@ -7,7 +7,7 @@ Inspired by https://github.com/phev-remote/ but written entirely in Go.
 
 For further hacking, read the [protocol documentation](protocol/README.md).
 
-Tested against a MY18 vehicle and Eclypse Cross 2022.
+Tested against a MY18 vehicle and an Eclipse Cross (2022).
 
 ![Home Assistant Screenshot](phev-ha.png)
 
@@ -19,7 +19,7 @@ Tested against a MY18 vehicle and Eclypse Cross 2022.
  * Fetch battery, charge, door, light status
  * Set lights and charge enable
  * Near-instant response to commands
- * *Only tested on a MY18 Phev* *Tested on Eclypse Cross 2022*
+ * *Tested on a MY18 Phev and an Eclipse Cross (2022)*
 
 Also includes some debugging utilities, and a vehicle emulator.
 
@@ -232,7 +232,7 @@ key-mgmt=wpa-psk
 psk=<Password>
 
 [ipv4]
-# This is optional to ignore vehicle DCHP server, and force static IP address and routing table setup
+# This is optional to ignore vehicle DHCP server, and force static IP address and routing table setup
 method=manual
 address1=192.168.8.47/24
 dns=8.8.8.8;8.8.4.4;
@@ -253,7 +253,7 @@ method=disabled
 ```
 
 - Reload the list of network connections `nmcli connection reload`.
-- Raise the nework connection `nmcli connection up WiFi-PHEV`.
+- Raise the network connection `nmcli connection up WiFi-PHEV`.
 - Check the connection status `nmcli connection`.
 
 After that the connection and WiFi network interface are managed by NetworkManager. It will reconnect automatically when the connection is lost,
