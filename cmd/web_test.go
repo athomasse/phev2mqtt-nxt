@@ -35,7 +35,7 @@ func setConfig(t *testing.T, key string, value interface{}) {
 func newTestWeb(t *testing.T, password string) (*webServer, *mqttClient) {
 	t.Helper()
 	m, _ := newTestClient("phev")
-	ws, err := newWebServer(m, "127.0.0.1:0", password)
+	ws, err := newWebServer(m, "127.0.0.1:0", password, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,20 +62,21 @@ func TestWebListenNeedsPasswordOffLocalhost(t *testing.T) {
 	defer log.StandardLogger().ReplaceHooks(log.LevelHooks{})
 	for _, tc := range []struct {
 		listen, password string
-		ok               bool
+		auth, ok         bool
 	}{
-		{"127.0.0.1:8080", "", true},
-		{"localhost:8080", "", true},
-		{"[::1]:8080", "", true},
-		{":8080", "", false},
-		{"0.0.0.0:8080", "", false},
-		{"192.168.1.40:8080", "", false},
-		{":8080", "secret", true},
-		{"8080", "secret", false},
+		{"127.0.0.1:8080", "", true, true},
+		{"localhost:8080", "", true, true},
+		{"[::1]:8080", "", true, true},
+		{":8080", "", true, false},
+		{"0.0.0.0:8080", "", true, false},
+		{"192.168.1.40:8080", "", true, false},
+		{":8080", "secret", true, true},
+		{":8080", "", false, true},
+		{"8080", "secret", true, false},
 	} {
-		_, err := newWebServer(m, tc.listen, tc.password)
+		_, err := newWebServer(m, tc.listen, tc.password, tc.auth)
 		if (err == nil) != tc.ok {
-			t.Errorf("listen %q password %q: err=%v, want ok=%v", tc.listen, tc.password, err, tc.ok)
+			t.Errorf("listen %q password %q auth %v: err=%v, want ok=%v", tc.listen, tc.password, tc.auth, err, tc.ok)
 		}
 	}
 }
@@ -93,6 +94,21 @@ func TestWebAuth(t *testing.T) {
 	}
 	if rec := request(t, ws, "GET", "/", "", "secret", false); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "<title>phev2mqtt</title>") {
 		t.Errorf("index: got %d", rec.Code)
+	}
+}
+
+func TestWebWithoutAuth(t *testing.T) {
+	m, _ := newTestClient("phev")
+	defer log.StandardLogger().ReplaceHooks(log.LevelHooks{})
+	ws, err := newWebServer(m, ":0", "ignored", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec := request(t, ws, "GET", "/api/state", "", "", false); rec.Code != http.StatusOK {
+		t.Errorf("web_auth false: got %d, want 200", rec.Code)
+	}
+	if rec := request(t, ws, "POST", "/api/command", `{"command":"headlights","value":"on"}`, "", false); rec.Code != http.StatusForbidden {
+		t.Errorf("web_auth false still needs X-Requested-With: got %d, want 403", rec.Code)
 	}
 }
 

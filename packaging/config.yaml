@@ -35,6 +35,8 @@ wifi_restart_command: "ip link set wlan0 down && sleep 3 && ip link set wlan0 up
 # web_listen: "127.0.0.1:8080"
 # web_listen: ":8080"
 # web_password: ""
+# Or no login at all. Anyone who can reach web_listen then controls the car.
+# web_auth: false
 # WiFi interface for the car, as managed by the web interface (needs
 # NetworkManager).
 # wifi_interface: wlan0

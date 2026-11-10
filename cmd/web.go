@@ -29,13 +29,21 @@ type webServer struct {
 	handler  http.Handler
 }
 
-func newWebServer(m *mqttClient, listen, password string) (*webServer, error) {
+// newWebServer serves on listen. Without auth there is no login at all;
+// that has to be asked for explicitly (web_auth: false) when the address is
+// reachable from the network.
+func newWebServer(m *mqttClient, listen, password string, auth bool) (*webServer, error) {
 	host, _, err := net.SplitHostPort(listen)
 	if err != nil {
 		return nil, fmt.Errorf("web_listen %q: want host:port, e.g. 127.0.0.1:8080 or :8080", listen)
 	}
-	if password == "" && !isLoopback(host) {
-		return nil, fmt.Errorf("web_listen %q is reachable from the network: set web_password", listen)
+	if !auth {
+		password = ""
+		if !isLoopback(host) {
+			log.Warnf("Web interface on %s without login (web_auth: false): anyone who can reach it controls the car", listen)
+		}
+	} else if password == "" && !isLoopback(host) {
+		return nil, fmt.Errorf("web_listen %q is reachable from the network: set web_password, or web_auth: false to run without login", listen)
 	}
 	ws := &webServer{
 		m:        m,

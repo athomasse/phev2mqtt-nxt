@@ -177,7 +177,9 @@ web_listen: ":8080"        # or "127.0.0.1:8080" for local access only
 web_password: "something long"   # required unless listening on localhost
 ```
 
-Log in with any user name and that password. MQTT settings saved in the web interface
+Log in with any user name and that password. `web_auth: false` turns the login off
+altogether; then anyone who can reach `web_listen` controls the car. Some managed browsers
+(e.g. Edge with an `AuthSchemes` policy) refuse basic auth and only show "unauthorized". MQTT settings saved in the web interface
 go to `/var/lib/phev2mqtt/settings.yaml` (with the package) and override the config file.
 The WiFi settings need NetworkManager; the package ships a polkit rule that lets only the
 `phev2mqtt` service manage WiFi connections. Setting raw registers is not possible from

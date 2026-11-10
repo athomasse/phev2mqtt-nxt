@@ -302,7 +302,7 @@ func (m *mqttClient) Run(cmd *cobra.Command, args []string) error {
 	m.lastError = nil
 
 	if listen := cfgString("web_listen"); listen != "" {
-		web, err := newWebServer(m, listen, cfgString("web_password"))
+		web, err := newWebServer(m, listen, cfgString("web_password"), cfgBool("web_auth"))
 		if err != nil {
 			return err
 		}
@@ -1072,6 +1072,9 @@ func init() {
 	viper.BindPFlag("update_interval", mqttCmd.Flags().Lookup("update_interval"))
 	viper.BindPFlag("wifi_interface", mqttCmd.Flags().Lookup("wifi_interface"))
 	viper.BindPFlag("web_listen", mqttCmd.Flags().Lookup("web_listen"))
+	// Config file only, like web_password; turning the login off must be a
+	// deliberate choice.
+	viper.SetDefault("web_auth", true)
 	viper.BindPFlag("wifi_restart_time", mqttCmd.Flags().Lookup("wifi_restart_time"))
 	viper.BindPFlag("wifi_restart_retry_time", mqttCmd.Flags().Lookup("wifi_restart_retry_time"))
 	viper.BindPFlag("wifi_restart_command", mqttCmd.Flags().Lookup("wifi_restart_command"))
