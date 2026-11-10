@@ -175,6 +175,10 @@ func (m *mqttClient) Run(cmd *cobra.Command, args []string) error {
 		log.Infof("WiFi restart disabled")
 	}
 
+	if m.updateInterval <= 0 {
+		return fmt.Errorf("update_interval must be positive, got %v", m.updateInterval)
+	}
+
 	m.haPublishedDiscovery	= false
 	m.lastError		= nil
 
@@ -211,7 +215,7 @@ func (m *mqttClient) Run(cmd *cobra.Command, args []string) error {
 		SetUsername(mqttUsername).
 		SetPassword(mqttPassword).
 		SetAutoReconnect(true).
-		SetDefaultPublishHandler(m.handleIncomingMqtt).
+		SetDefaultPublishHandler(m.safeHandleIncomingMqtt).
 		SetOnConnectHandler(onConnect).
 		SetWill(m.topic("/available"), "offline", 0, true)
 
@@ -260,10 +264,28 @@ func (m *mqttClient) publish(topic, payload string) {
 //	}
 }
 
+// A panic in a paho callback takes down the whole daemon, so one bad
+// message must not get that far.
+func (m *mqttClient) safeHandleIncomingMqtt(mqtt_client mqtt.Client, msg mqtt.Message) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Errorf("Panic handling MQTT topic [%s]: %v", msg.Topic(), r)
+		}
+	}()
+	m.handleIncomingMqtt(mqtt_client, msg)
+}
+
 func (m *mqttClient) handleIncomingMqtt(mqtt_client mqtt.Client, msg mqtt.Message) {
 	log.Infof("Topic: [%s] Payload: [%s]", msg.Topic(), msg.Payload())
 
-	topicParts := strings.Split(msg.Topic(), "/")
+	// The car client only exists once handlePhev has run; commands that
+	// arrive before that (e.g. retained ones, right after subscribing) are
+	// dropped.
+	if m.phev == nil && msg.Topic() != m.haDiscoveryPrefix+"/status" && msg.Topic() != m.topic("/connection") {
+		log.Infof("Not connected to the car yet, ignoring [%s]", msg.Topic())
+		return
+	}
+
 	if msg.Topic() == m.haDiscoveryPrefix+"/status" {
 		// Home Assistant birth message - it has restarted, so needs
 		// the discovery configs and availability republished.
@@ -275,13 +297,11 @@ func (m *mqttClient) handleIncomingMqtt(mqtt_client mqtt.Client, msg mqtt.Messag
 			}
 		}
 	} else if strings.HasPrefix(msg.Topic(), m.topic("/set/register/")) {
-		if len(topicParts) != 4 {
-			log.Infof("Bad topic format [%s]", msg.Topic())
-			return
-		}
-		register, err := hex.DecodeString(topicParts[3])
-		if err != nil {
-			log.Infof("Bad register in topic [%s]: %v", msg.Topic(), err)
+		// Strip the prefix instead of splitting the whole topic: the prefix
+		// itself may contain slashes (e.g. "home/phev").
+		register, err := hex.DecodeString(strings.TrimPrefix(msg.Topic(), m.topic("/set/register/")))
+		if err != nil || len(register) != 1 {
+			log.Infof("Bad register in topic [%s], want one hex byte", msg.Topic())
 			return
 		}
 		data, err := hex.DecodeString(string(msg.Payload()))
@@ -298,14 +318,18 @@ func (m *mqttClient) handleIncomingMqtt(mqtt_client mqtt.Client, msg mqtt.Messag
 		switch payload {
 		case "off":
 			m.enabled = false
-			m.phev.Close()
+			if m.phev != nil {
+				m.phev.Close()
+			}
 			m.client.Publish(m.topic("/available"), 0, true, "offline")
 		case "on":
 			m.enabled = true
 		case "restart":
 			m.enabled = true
 			m.client.Publish(m.topic("/available"), 0, true, "offline")
-			m.phev.Close()
+			if m.phev != nil {
+				m.phev.Close()
+			}
 		}
 	} else if msg.Topic() == m.topic("/set/parkinglights") {
 		values := map[string]byte{"on": 0x1, "off": 0x2}
@@ -319,7 +343,7 @@ func (m *mqttClient) handleIncomingMqtt(mqtt_client mqtt.Client, msg mqtt.Messag
 		values := map[string]byte{"on": 0x1, "off": 0x2}
 		if v, ok := values[strings.ToLower(string(msg.Payload()))]; ok {
 			if err := m.phev.SetRegister(0xa, []byte{v}); err != nil {
-				log.Infof("Error setting register 0xb: %v", err)
+				log.Infof("Error setting register 0xa: %v", err)
 				return
 			}
 		}
@@ -353,7 +377,11 @@ func (m *mqttClient) handleIncomingMqtt(mqtt_client mqtt.Client, msg mqtt.Messag
 			return
 		}
 		if mode == 0x4 { // set/climate/mode -> "heat"
-			mode = modeMap[payload]
+			// An unknown payload would otherwise become mode 0, i.e. "off".
+			if mode, ok = modeMap[payload]; !ok || mode == 0x4 {
+				log.Errorf("Unknown climate mode: %s", payload)
+				return
+			}
 			payload = "on"
 		}
 		if payload == "off" {
@@ -395,6 +423,8 @@ func (m *mqttClient) handleIncomingMqtt(mqtt_client mqtt.Client, msg mqtt.Messag
 				log.Infof("Error setting AC mode: %v", err)
 				return
 			}
+		} else {
+			log.Errorf("Ignoring climate command: model year of the car not known yet")
 		}
 	} else if msg.Topic() == m.topic("/settings/dump") {
 		log.Infof("CURRENT_SETTINGS:")
@@ -440,7 +470,13 @@ func (m *mqttClient) handlePhev(cmd *cobra.Command) error {
 	for {
 		select {
 		case <-updaterTicker.C:
-			m.phev.SetRegister(0x6, []byte{0x3})
+			// Not inline: SetRegister waits up to 10s for the ack, which the
+			// reader can only deliver while this loop keeps draining Recv.
+			go func(phev *client.Client) {
+				if err := phev.SetRegister(0x6, []byte{0x3}); err != nil {
+					log.Debugf("Error requesting update: %v", err)
+				}
+			}(m.phev)
 		case msg, ok := <-m.phev.Recv:
 			if !ok {
 				log.Infof("Connection closed.")
@@ -728,7 +764,9 @@ func (m *mqttClient) publishHomeAssistantDiscovery(vin, topic, name string) {
 		"%s/switch/%s_cancel_charge_timer/config": `{
 		"name": "__NAME__ Disable Charge Timer",
 		"icon": "mdi:timer-off",
-		"state_topic": "~/battery/charging",
+		"state_topic": "~/charge/charging",
+		"state_on": "on",
+		"state_off": "off",
 		"command_topic": "~/set/cancelchargetimer",
 		"avty_t": "~/available",
 		"unique_id": "__VIN___cancel_charge_timer",
@@ -790,7 +828,8 @@ func (m *mqttClient) publishHomeAssistantDiscovery(vin, topic, name string) {
 		"~": "__TOPIC__"}`,
 		"%s/select/%s_climate_on/config": `{
 				"name": "__NAME__ climate state",
-				"state_topic": "~/climate/mode",
+				"state_topic": "~/climate/state",
+				"value_template": "{{ value if value in ['off', 'heat', 'cool', 'windscreen'] else 'off' }}",
 				"command_topic": "~/set/climate/mode",
 				"options": [ "off", "heat", "cool", "windscreen"],
 				"avty_t": "~/available",
