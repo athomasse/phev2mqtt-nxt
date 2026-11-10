@@ -37,6 +37,35 @@ Contributions and PRs are welcome.
 
 ## Getting started.
 
+### Install the package (Debian, Ubuntu, Raspberry Pi OS)
+
+Each [release](https://github.com/athomasse/phev2mqtt-nxt/releases) has a `.deb` for
+`armhf` (every 32-bit Raspberry Pi, including the B+ and Zero), `arm64`, `amd64` and
+`i386`, plus plain binaries and a `SHA256SUMS` file. The package installs the binary, a
+hardened systemd service running as its own `phev2mqtt` user, and a commented config
+file in `/etc/phev2mqtt/config.yaml` that upgrades leave alone.
+
+```
+version=0.4.0
+deb=phev2mqtt_${version}_$(dpkg --print-architecture).deb
+base=https://github.com/athomasse/phev2mqtt-nxt/releases/download/v$version
+curl -fLO "$base/SHA256SUMS" -fLO "$base/$deb"
+sha256sum -c --ignore-missing SHA256SUMS
+sudo apt install "./$deb"
+```
+
+Then:
+
+1. Set up the WiFi connection to the car, see [Connecting to the vehicle](#connecting-to-the-vehicle)
+   and the example files in `/usr/share/doc/phev2mqtt/examples/`.
+2. Register with the car once: `phev2mqtt client register`.
+3. Fill in the MQTT broker: `sudoedit /etc/phev2mqtt/config.yaml`.
+4. Start the gateway: `sudo systemctl enable --now phev2mqtt`, and follow its log with
+   `journalctl -fu phev2mqtt`.
+
+The service cannot use `sudo`; it may run `ip link` itself, which is all the default
+`wifi_restart_command` in the config file needs.
+
 ### Compiling
 
 #### Install Go
@@ -166,6 +195,9 @@ wifi_restart_retry_time: 2m
 
 It's useful to have the tool auto-start when running on e.g a Raspberry Pi. The following
 describes how to set this up.
+
+With the `.deb` package the service, user and config file are already in place: only the
+WiFi steps below apply.
 
 - Edit or add to `/etc/systemd/network/00-default.link` with the following:
 

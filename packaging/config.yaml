@@ -1,0 +1,29 @@
+# phev2mqtt configuration. The keys are the command line flags of
+# `phev2mqtt client mqtt` (see `phev2mqtt client mqtt --help`).
+# Only root and the phev2mqtt service can read this file.
+# After a change: sudo systemctl restart phev2mqtt
+
+# MQTT broker.
+mqtt_server: "tcp://127.0.0.1:1883"
+mqtt_username: ""
+mqtt_password: ""
+# mqtt_topic_prefix: phev
+
+# Home Assistant MQTT discovery.
+# ha_discovery: true
+# ha_discovery_prefix: homeassistant
+
+# The car's own WiFi always serves this address.
+# address: "192.168.8.46:8080"
+
+# How often to ask the car for a full status update.
+# update_interval: 5m
+
+# Restart the WiFi interface when the car has been unreachable this long
+# (0s = never). The service may run `ip link` for this; it cannot use sudo.
+wifi_restart_time: 0s
+wifi_restart_retry_time: 2m
+wifi_restart_command: "ip link set wlan0 down && sleep 3 && ip link set wlan0 up"
+
+# Ignore all set/... commands from MQTT (lights, climate, registers).
+# mqtt_disable_register_set_command: false
