@@ -35,13 +35,14 @@ jobs:
         run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.48.0
 
       # Tag v1.2.3 -> 1.2.3; other builds get a version that sorts below any
-      # release, so a test package never blocks upgrading to the next one.
+      # release, so a test package never blocks upgrading to the next one, and
+      # by commit time to the second (the hash alone does not sort).
       - name: Build binaries and packages
         run: |
           if [ "$GITHUB_REF_TYPE" = tag ]; then
             version=${GITHUB_REF_NAME#v}
           else
-            version=0.0.0~git$(date -u +%Y%m%d).$(git rev-parse --short HEAD)
+            version=0.0.0~git$(TZ=UTC git log -1 --format=%cd --date=format-local:%Y%m%d%H%M%S).$(git rev-parse --short HEAD)
           fi
           PATH=$PATH:$(go env GOPATH)/bin packaging/build.sh "$version"
 
