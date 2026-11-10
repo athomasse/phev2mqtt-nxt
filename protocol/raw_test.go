@@ -54,7 +54,7 @@ func TestXorMessage(t *testing.T) {
 			}
 			got := XorMessageWith(in, test.xor)
 			if diff := hexCmp(got, test.want); diff != "" {
-				t.Errorf(diff)
+				t.Error(diff)
 			}
 		})
 	}

@@ -714,7 +714,6 @@ type RegisterPreACState struct {
 
 func (r *RegisterPreACState) Encode() *PhevMessage {
 	panic("unimplemented")
-	return nil
 }
 
 func (r *RegisterPreACState) Decode(m *PhevMessage) {
@@ -947,7 +946,6 @@ type RegisterLightStatus struct {
 
 func (r *RegisterLightStatus) Encode() *PhevMessage {
 	panic("unimplemented")
-	return nil
 }
 
 func (r *RegisterLightStatus) Decode(m *PhevMessage) {
