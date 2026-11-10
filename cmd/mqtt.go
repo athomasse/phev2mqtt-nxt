@@ -18,6 +18,7 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"fmt"
 	"github.com/buxtronix/phev2mqtt/client"
@@ -26,6 +27,7 @@ import (
 	"github.com/spf13/viper"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
@@ -105,7 +107,7 @@ func (c *climate) mqttStates() map[string]string {
 var lastWifiRestart time.Time
 
 func restartWifi(cmd *cobra.Command) error {
-	restartRetryTime := viper.GetDuration("wifi_restart_retry_time")
+	restartRetryTime := cfgDuration("wifi_restart_retry_time")
 
 	if time.Now().Sub(lastWifiRestart) < restartRetryTime {
 		return nil
@@ -113,8 +115,13 @@ func restartWifi(cmd *cobra.Command) error {
 	defer func() {
 		lastWifiRestart = time.Now()
 	}()
+	return runWifiRestart()
+}
 
-	restartCommand := viper.GetString("wifi_restart_command")
+// runWifiRestart runs wifi_restart_command. Never for longer than a minute:
+// a hanging command would otherwise stall the car loop.
+func runWifiRestart() error {
+	restartCommand := cfgString("wifi_restart_command")
 	if restartCommand == "" {
 		log.Debugf("wifi restart disabled")
 		return nil
@@ -122,7 +129,9 @@ func restartWifi(cmd *cobra.Command) error {
 
 	log.Debugf("Attempting to restart wifi")
 
-	restartCmd := exec.Command("/bin/sh", "-c", restartCommand)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	restartCmd := exec.CommandContext(ctx, "/bin/sh", "-c", restartCommand)
 
 	stdoutStderr, err := restartCmd.CombinedOutput()
 	if len( stdoutStderr ) > 0 {
@@ -132,44 +141,154 @@ func restartWifi(cmd *cobra.Command) error {
 }
 
 type mqttClient struct {
-	client         mqtt.Client
-	options        *mqtt.ClientOptions
-	mqttData       map[string]string
 	updateInterval time.Duration
+	lastError      error
+	climate        *climate
 
-	phev         *client.Client
-	lastConnect  time.Time
-	lastError    error
-	lastVIN      string
-	carConnected bool
+	// Shared with the MQTT callbacks and the web interface.
+	state *gatewayState
+	web   *webServer
 
-	prefix string
-
-	haDiscovery		bool
-	haDiscoveryPrefix	string
-	haPublishedDiscovery	bool
-
-	climate *climate
-	enabled bool
+	// The broker connection and its settings; the web interface can change
+	// them at runtime (connectMQTT), so they are guarded by mqttMu.
+	mqttMu               sync.Mutex
+	client               mqtt.Client
+	prefix               string
+	haDiscovery          bool
+	haDiscoveryPrefix    string
+	haPublishedDiscovery bool
 }
 
 func (m *mqttClient) topic(topic string) string {
-	return fmt.Sprintf("%s%s", m.prefix, topic)
+	m.mqttMu.Lock()
+	defer m.mqttMu.Unlock()
+	return m.prefix + topic
+}
+
+// haStatusTopic is where Home Assistant announces that it (re)started.
+func (m *mqttClient) haStatusTopic() string {
+	m.mqttMu.Lock()
+	defer m.mqttMu.Unlock()
+	return m.haDiscoveryPrefix + "/status"
+}
+
+func (m *mqttClient) mqtt() mqtt.Client {
+	m.mqttMu.Lock()
+	defer m.mqttMu.Unlock()
+	return m.client
+}
+
+func (m *mqttClient) mqttConnected() bool {
+	c := m.mqtt()
+	return c != nil && c.IsConnected()
+}
+
+// mqttPublish publishes topic (a full topic, prefix included). It never
+// blocks the caller for long: a broker that is down or not configured must
+// not stall the car loop.
+func (m *mqttClient) mqttPublish(topic string, qos byte, retained bool, payload string) {
+	c := m.mqtt()
+	if c == nil {
+		return
+	}
+	token := c.Publish(topic, qos, retained, payload)
+	if qos == 0 {
+		return
+	}
+	if !token.WaitTimeout(5 * time.Second) {
+		log.Warnf("Timed out publishing to %s", topic)
+	} else if token.Error() != nil {
+		log.Error(token.Error())
+	}
+}
+
+// connectMQTT (re)connects to the broker with the current settings. The
+// connection is retried in the background, so a broker that is down or not
+// configured yet does not stop the gateway or its web interface.
+func (m *mqttClient) connectMQTT() {
+	server := cfgString("mqtt_server")
+	username := cfgString("mqtt_username")
+	password := cfgString("mqtt_password")
+	disableSet := cfgBool("mqtt_disable_register_set_command")
+
+	m.mqttMu.Lock()
+	old := m.client
+	m.client = nil
+	m.prefix = cfgString("mqtt_topic_prefix")
+	m.haDiscovery = cfgBool("ha_discovery")
+	m.haDiscoveryPrefix = cfgString("ha_discovery_prefix")
+	m.haPublishedDiscovery = false
+	m.mqttMu.Unlock()
+	if old != nil {
+		old.Disconnect(250)
+	}
+	defer m.state.notify()
+
+	if server == "" {
+		log.Warn("No mqtt_server configured, not connecting to MQTT")
+		return
+	}
+	if disableSet {
+		log.Info("Setting vechicle registers via MQTT is disabled")
+	}
+
+	// Subscriptions and retained state must be re-established on every
+	// (re)connection - a broker restart silently drops both.
+	onConnect := func(mqtt_client mqtt.Client) {
+		log.Info("Connected to MQTT broker")
+		topics := []string{m.topic("/connection"), m.topic("/settings/#"), m.haStatusTopic()}
+		if !disableSet {
+			topics = append(topics, m.topic("/set/#"))
+		}
+		for _, t := range topics {
+			if token := mqtt_client.Subscribe(t, 0, nil); token.Wait() && token.Error() != nil {
+				log.Errorf("Error subscribing to %s: %v", t, token.Error())
+			}
+		}
+		availability := "offline"
+		if m.state.isConnected() {
+			availability = "online"
+		}
+		mqtt_client.Publish(m.topic("/available"), 0, true, availability)
+		m.mqttMu.Lock()
+		m.haPublishedDiscovery = false
+		m.mqttMu.Unlock()
+		m.republishDiscovery()
+		m.state.notify()
+	}
+
+	options := mqtt.NewClientOptions().
+		AddBroker(server).
+		SetClientID("phev2mqtt").
+		SetUsername(username).
+		SetPassword(password).
+		SetAutoReconnect(true).
+		SetConnectRetry(true).
+		SetConnectRetryInterval(10 * time.Second).
+		SetMaxReconnectInterval(time.Minute).
+		SetDefaultPublishHandler(m.safeHandleIncomingMqtt).
+		SetOnConnectHandler(onConnect).
+		SetConnectionLostHandler(func(_ mqtt.Client, err error) {
+			log.Warnf("Lost connection to MQTT broker: %v", err)
+			m.state.notify()
+		}).
+		SetWill(m.topic("/available"), "offline", 0, true)
+
+	c := mqtt.NewClient(options)
+	m.mqttMu.Lock()
+	m.client = c
+	m.mqttMu.Unlock()
+	log.Infof("Connecting to MQTT broker %s", server)
+	c.Connect() // With ConnectRetry this keeps trying in the background.
 }
 
 func (m *mqttClient) Run(cmd *cobra.Command, args []string) error {
-	m.enabled = true // Default.
-
-	mqttServer		:= viper.GetString("mqtt_server")
-	mqttUsername		:= viper.GetString("mqtt_username")
-	mqttPassword		:= viper.GetString("mqtt_password")
-	mqttDisableSet		:= viper.GetBool("mqtt_disable_register_set_command")
-	m.prefix		 = viper.GetString("mqtt_topic_prefix")
-	m.haDiscovery		 = viper.GetBool("ha_discovery")
-	m.haDiscoveryPrefix	 = viper.GetString("ha_discovery_prefix")
-	m.updateInterval	 = viper.GetDuration("update_interval")
-	wifiRestartTime		:= viper.GetDuration("wifi_restart_time")
-	restartCommand		:= viper.GetString("wifi_restart_command")
+	if err := loadWebSettings(); err != nil {
+		return err
+	}
+	m.updateInterval = cfgDuration("update_interval")
+	wifiRestartTime := cfgDuration("wifi_restart_time")
+	restartCommand := cfgString("wifi_restart_command")
 
 	if restartCommand == "" {
 		log.Infof("WiFi restart disabled")
@@ -179,53 +298,22 @@ func (m *mqttClient) Run(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("update_interval must be positive, got %v", m.updateInterval)
 	}
 
-	m.haPublishedDiscovery	= false
-	m.lastError		= nil
+	m.state = newGatewayState()
+	m.lastError = nil
 
-	if mqttDisableSet {
-		log.Info("Setting vechicle registers via MQTT is disabled")
-	}
-	m.mqttData = map[string]string{}
-
-	// Subscriptions and retained state must be re-established on every
-	// (re)connection - a broker restart silently drops both.
-	onConnect := func(mqtt_client mqtt.Client) {
-		log.Info("Connected to MQTT broker")
-		topics := []string{m.topic("/connection"), m.topic("/settings/#"), m.haDiscoveryPrefix + "/status"}
-		if !mqttDisableSet {
-			topics = append(topics, m.topic("/set/#"))
+	if listen := cfgString("web_listen"); listen != "" {
+		web, err := newWebServer(m, listen, cfgString("web_password"))
+		if err != nil {
+			return err
 		}
-		for _, t := range topics {
-			if token := mqtt_client.Subscribe(t, 0, nil); token.Wait() && token.Error() != nil {
-				log.Errorf("Error subscribing to %s: %v", t, token.Error())
-			}
-		}
-		availability := "offline"
-		if m.carConnected {
-			availability = "online"
-		}
-		mqtt_client.Publish(m.topic("/available"), 0, true, availability)
-		m.haPublishedDiscovery = false
-		m.republishDiscovery()
+		m.web = web
+		go web.serve()
 	}
 
-	m.options = mqtt.NewClientOptions().
-		AddBroker(mqttServer).
-		SetClientID("phev2mqtt").
-		SetUsername(mqttUsername).
-		SetPassword(mqttPassword).
-		SetAutoReconnect(true).
-		SetDefaultPublishHandler(m.safeHandleIncomingMqtt).
-		SetOnConnectHandler(onConnect).
-		SetWill(m.topic("/available"), "offline", 0, true)
-
-	m.client = mqtt.NewClient(m.options)
-	if token := m.client.Connect(); token.Wait() && token.Error() != nil {
-		return token.Error()
-	}
+	m.connectMQTT()
 
 	for {
-		if m.enabled {
+		if m.state.isEnabled() {
 			if err := m.handlePhev(cmd); err != nil {
 				// Do not flood the log with the same messages every second
 				if m.lastError == nil || m.lastError.Error() != err.Error() {
@@ -234,11 +322,11 @@ func (m *mqttClient) Run(cmd *cobra.Command, args []string) error {
 				}
 			}
 			// Publish as offline if last connection was >30s ago.
-			if time.Now().Sub(m.lastConnect) > 30*time.Second {
-				m.client.Publish(m.topic("/available"), 0, true, "offline")
+			if m.state.sinceLastConnect() > 30*time.Second {
+				m.mqttPublish(m.topic("/available"), 0, true, "offline")
 			}
 			// Restart Wifi interface if > wifi_restart_time.
-			if wifiRestartTime > 0 && time.Now().Sub(m.lastConnect) > wifiRestartTime {
+			if wifiRestartTime > 0 && m.state.sinceLastConnect() > wifiRestartTime {
 				if err := restartWifi(cmd); err != nil {
 					log.Errorf("Error restarting wifi: %v", err)
 				}
@@ -251,17 +339,16 @@ func (m *mqttClient) Run(cmd *cobra.Command, args []string) error {
 
 // Republish Home Assistant discovery, if the VIN is already known.
 func (m *mqttClient) republishDiscovery() {
-	if m.lastVIN == "" {
+	vin := m.state.getVIN()
+	if vin == "" {
 		return
 	}
-	m.publishHomeAssistantDiscovery(m.lastVIN, m.prefix, "Phev")
+	m.publishHomeAssistantDiscovery(vin, m.topic(""), "Phev")
 }
 
 func (m *mqttClient) publish(topic, payload string) {
-//	if cache := m.mqttData[topic]; cache != payload {
-		m.client.Publish(m.topic(topic), 0, false, payload)
-		m.mqttData[topic] = payload
-//	}
+	m.mqttPublish(m.topic(topic), 0, false, payload)
+	m.state.setValue(topic, payload)
 }
 
 // A panic in a paho callback takes down the whole daemon, so one bad
@@ -280,20 +367,25 @@ func (m *mqttClient) handleIncomingMqtt(mqtt_client mqtt.Client, msg mqtt.Messag
 
 	// The car client only exists once handlePhev has run; commands that
 	// arrive before that (e.g. retained ones, right after subscribing) are
-	// dropped.
-	if m.phev == nil && msg.Topic() != m.haDiscoveryPrefix+"/status" && msg.Topic() != m.topic("/connection") {
+	// dropped. One snapshot of it for the whole command: handlePhev replaces
+	// it on every connection attempt.
+	phev := m.state.car()
+	haStatus := m.haStatusTopic()
+	if phev == nil && msg.Topic() != haStatus && msg.Topic() != m.topic("/connection") {
 		log.Infof("Not connected to the car yet, ignoring [%s]", msg.Topic())
 		return
 	}
 
-	if msg.Topic() == m.haDiscoveryPrefix+"/status" {
+	if msg.Topic() == haStatus {
 		// Home Assistant birth message - it has restarted, so needs
 		// the discovery configs and availability republished.
 		if strings.ToLower(string(msg.Payload())) == "online" {
+			m.mqttMu.Lock()
 			m.haPublishedDiscovery = false
+			m.mqttMu.Unlock()
 			m.republishDiscovery()
-			if m.carConnected {
-				m.client.Publish(m.topic("/available"), 0, true, "online")
+			if m.state.isConnected() {
+				m.mqttPublish(m.topic("/available"), 0, true, "online")
 			}
 		}
 	} else if strings.HasPrefix(msg.Topic(), m.topic("/set/register/")) {
@@ -309,7 +401,7 @@ func (m *mqttClient) handleIncomingMqtt(mqtt_client mqtt.Client, msg mqtt.Messag
 			log.Infof("Bad payload [%s]: %v", msg.Payload(), err)
 			return
 		}
-		if err := m.phev.SetRegister(register[0], data); err != nil {
+		if err := phev.SetRegister(register[0], data); err != nil {
 			log.Infof("Error setting register %02x: %v", register[0], err)
 			return
 		}
@@ -317,24 +409,24 @@ func (m *mqttClient) handleIncomingMqtt(mqtt_client mqtt.Client, msg mqtt.Messag
 		payload := strings.ToLower(string(msg.Payload()))
 		switch payload {
 		case "off":
-			m.enabled = false
-			if m.phev != nil {
-				m.phev.Close()
+			m.state.setEnabled(false)
+			if phev != nil {
+				phev.Close()
 			}
-			m.client.Publish(m.topic("/available"), 0, true, "offline")
+			m.mqttPublish(m.topic("/available"), 0, true, "offline")
 		case "on":
-			m.enabled = true
+			m.state.setEnabled(true)
 		case "restart":
-			m.enabled = true
-			m.client.Publish(m.topic("/available"), 0, true, "offline")
-			if m.phev != nil {
-				m.phev.Close()
+			m.state.setEnabled(true)
+			m.mqttPublish(m.topic("/available"), 0, true, "offline")
+			if phev != nil {
+				phev.Close()
 			}
 		}
 	} else if msg.Topic() == m.topic("/set/parkinglights") {
 		values := map[string]byte{"on": 0x1, "off": 0x2}
 		if v, ok := values[strings.ToLower(string(msg.Payload()))]; ok {
-			if err := m.phev.SetRegister(0xb, []byte{v}); err != nil {
+			if err := phev.SetRegister(0xb, []byte{v}); err != nil {
 				log.Infof("Error setting register 0xb: %v", err)
 				return
 			}
@@ -342,24 +434,24 @@ func (m *mqttClient) handleIncomingMqtt(mqtt_client mqtt.Client, msg mqtt.Messag
 	} else if msg.Topic() == m.topic("/set/headlights") {
 		values := map[string]byte{"on": 0x1, "off": 0x2}
 		if v, ok := values[strings.ToLower(string(msg.Payload()))]; ok {
-			if err := m.phev.SetRegister(0xa, []byte{v}); err != nil {
+			if err := phev.SetRegister(0xa, []byte{v}); err != nil {
 				log.Infof("Error setting register 0xa: %v", err)
 				return
 			}
 		}
 	} else if msg.Topic() == m.topic("/set/cancelchargetimer") {
-		if err := m.phev.SetRegister(0x17, []byte{0x1}); err != nil {
+		if err := phev.SetRegister(0x17, []byte{0x1}); err != nil {
 			log.Infof("Error setting register 0x17: %v", err)
 			return
 		}
-		if err := m.phev.SetRegister(0x17, []byte{0x11}); err != nil {
+		if err := phev.SetRegister(0x17, []byte{0x11}); err != nil {
 			log.Infof("Error setting register 0x17: %v", err)
 			return
 		}
 	} else if strings.HasPrefix(msg.Topic(), m.topic("/set/climate/state")) {
 		payload := strings.ToLower(string(msg.Payload()))
 		if payload == "reset" {
-			if err := m.phev.SetRegister(protocol.SetAckPreACTermRegister, []byte{0x1}); err != nil {
+			if err := phev.SetRegister(protocol.SetAckPreACTermRegister, []byte{0x1}); err != nil {
 				log.Infof("Error acknowledging Pre-AC termination: %v", err)
 				return
 			}
@@ -393,14 +485,15 @@ func (m *mqttClient) handleIncomingMqtt(mqtt_client mqtt.Client, msg mqtt.Messag
 			return
 		}
 
-		if m.phev.ModelYear == client.ModelYear14 {
+		my := m.state.getModelYear()
+		if my == client.ModelYear14 {
 			// Set the AC mode first
 			registerPayload := bytes.Repeat([]byte{0xff}, 15)
 			registerPayload[0] = 0x0
 			registerPayload[1] = 0x0
 			// MY14 encodes the duration in the high nibble (10min=0x00, 20min=0x10, 30min=0x20).
 			registerPayload[6] = mode | (duration << 4)
-			if err := m.phev.SetRegister(protocol.SetACModeRegisterMY14, registerPayload); err != nil {
+			if err := phev.SetRegister(protocol.SetACModeRegisterMY14, registerPayload); err != nil {
 				log.Infof("Error setting AC mode: %v", err)
 				return
 			}
@@ -410,16 +503,16 @@ func (m *mqttClient) handleIncomingMqtt(mqtt_client mqtt.Client, msg mqtt.Messag
 			if mode == 0x0 {
 				acEnabled = 0x01
 			}
-			if err := m.phev.SetRegister(protocol.SetACEnabledRegisterMY14, []byte{acEnabled}); err != nil {
+			if err := phev.SetRegister(protocol.SetACEnabledRegisterMY14, []byte{acEnabled}); err != nil {
 				log.Infof("Error setting AC enabled state: %v", err)
 				return
 			}
-		} else if m.phev.ModelYear == client.ModelYear18 || m.phev.ModelYear == client.ModelYear24 {
+		} else if my == client.ModelYear18 || my == client.ModelYear24 {
 			state := byte(0x02)
 			if mode == 0x0 {
 				state = 0x1
 			}
-			if err := m.phev.SetRegister(protocol.SetACModeRegisterMY18, []byte{state, mode, duration, 0x0}); err != nil {
+			if err := phev.SetRegister(protocol.SetACModeRegisterMY18, []byte{state, mode, duration, 0x0}); err != nil {
 				log.Infof("Error setting AC mode: %v", err)
 				return
 			}
@@ -428,40 +521,38 @@ func (m *mqttClient) handleIncomingMqtt(mqtt_client mqtt.Client, msg mqtt.Messag
 		}
 	} else if msg.Topic() == m.topic("/settings/dump") {
 		log.Infof("CURRENT_SETTINGS:")
-		log.Infof("\n%s", m.phev.Settings.Dump())
-		m.phev.Settings.Clear()
+		log.Infof("\n%s", phev.Settings.Dump())
+		phev.Settings.Clear()
 	} else {
 		log.Errorf("Unknown topic from mqtt: %s", msg.Topic())
 	}
 }
 
 func (m *mqttClient) handlePhev(cmd *cobra.Command) error {
-	var err error
-	address := viper.GetString("address")
-	m.phev, err = client.New(client.AddressOption(address))
+	address := cfgString("address")
+	phev, err := client.New(client.AddressOption(address))
 	if err != nil {
 		return err
 	}
+	m.state.setCar(phev)
 
-	if err := m.phev.Connect(); err != nil {
+	if err := phev.Connect(); err != nil {
 		return err
 	}
 	// A connection that outlives this attempt keeps pinging the car and
 	// occupies its single client slot, blocking all future reconnects.
-	defer m.phev.Close()
+	defer phev.Close()
 
-	if err := m.phev.Start(); err != nil {
+	if err := phev.Start(); err != nil {
 		return err
 	}
-	m.carConnected = true
-	m.client.Publish(m.topic("/available"), 0, true, "online")
+	// ModelYear is set before Start returns; later changes would race.
+	m.state.setConnected(true, phev.ModelYear)
+	m.mqttPublish(m.topic("/available"), 0, true, "online")
 
 	m.lastError = nil
 
-	defer func() {
-		m.carConnected = false
-		m.lastConnect = time.Now()
-	}()
+	defer m.state.setConnected(false, client.ModelYearUnknown)
 
 	var encodingErrorCount = 0
 	var lastEncodingError time.Time
@@ -476,8 +567,8 @@ func (m *mqttClient) handlePhev(cmd *cobra.Command) error {
 				if err := phev.SetRegister(0x6, []byte{0x3}); err != nil {
 					log.Debugf("Error requesting update: %v", err)
 				}
-			}(m.phev)
-		case msg, ok := <-m.phev.Recv:
+			}(phev)
+		case msg, ok := <-phev.Recv:
 			if !ok {
 				log.Infof("Connection closed.")
 				updaterTicker.Stop()
@@ -499,7 +590,7 @@ func (m *mqttClient) handlePhev(cmd *cobra.Command) error {
 					break
 				}
 				m.publishRegister(msg)
-				if err := m.phev.SendMessage(&protocol.PhevMessage{
+				if err := phev.SendMessage(&protocol.PhevMessage{
 					Type:     protocol.CmdOutSend,
 					Register: msg.Register,
 					Ack:      protocol.Ack,
@@ -528,9 +619,9 @@ func (m *mqttClient) publishRegister(msg *protocol.PhevMessage) {
 	m.publish(fmt.Sprintf("/register/%02x", msg.Register), dataStr)
 	switch reg := msg.Reg.(type) {
 	case *protocol.RegisterVIN:
-		m.lastVIN = reg.VIN
+		m.state.setVIN(reg.VIN)
 		m.publish("/vin", reg.VIN)
-		m.publishHomeAssistantDiscovery(reg.VIN, m.prefix, "Phev")
+		m.publishHomeAssistantDiscovery(reg.VIN, m.topic(""), "Phev")
 		m.publish("/registrations", fmt.Sprintf("%d", reg.Registrations))
 	case *protocol.RegisterECUVersion:
 		m.publish("/ecuversion", reg.Version)
@@ -550,7 +641,7 @@ func (m *mqttClient) publishRegister(msg *protocol.PhevMessage) {
 			m.publish("/charge/remaining", fmt.Sprintf("%d", reg.Remaining))
 		} else {
 			log.Debugf("Ignoring charge remanining reading: %v", reg.Remaining)
-			if cache := m.mqttData["/charge/remaining"]; cache != "" {
+			if cache := m.state.value("/charge/remaining"); cache != "" {
 				m.publish("/charge/remaining", cache)
 				log.Debugf("Publishing last best known charge remaining reading: %v", cache)
 			}
@@ -570,7 +661,7 @@ func (m *mqttClient) publishRegister(msg *protocol.PhevMessage) {
 		if (reg.Level > 5) && (reg.Level < 255) {
 			m.publish("/battery/level", fmt.Sprintf("%d", reg.Level))
 		} else {
-			if cache := m.mqttData["/battery/level"]; cache != "" {
+			if cache := m.state.value("/battery/level"); cache != "" {
 				m.publish("/battery/level", cache )
 				log.Debugf("Ignoring battery level reading: %v, publishing last best known: %v", reg.Level, cache)
 			}
@@ -592,10 +683,16 @@ func (m *mqttClient) publishRegister(msg *protocol.PhevMessage) {
 // Uses the vehicle VIN, so sent after VIN discovery.
 func (m *mqttClient) publishHomeAssistantDiscovery(vin, topic, name string) {
 
-	if m.haPublishedDiscovery || !m.haDiscovery {
+	// Only to a connected broker: onConnect publishes it again anyway, and
+	// waiting for 20+ publish timeouts would stall the car loop.
+	m.mqttMu.Lock()
+	if m.haPublishedDiscovery || !m.haDiscovery || m.client == nil || !m.client.IsConnected() {
+		m.mqttMu.Unlock()
 		return
 	}
 	m.haPublishedDiscovery = true
+	discoveryPrefix := m.haDiscoveryPrefix
+	m.mqttMu.Unlock()
 	discoveryData := map[string]string{
 		// Doors.
 		"%s/binary_sensor/%s_door_locked/config": `{
@@ -929,14 +1026,11 @@ func (m *mqttClient) publishHomeAssistantDiscovery(vin, topic, name string) {
 		"__TOPIC__": topic,
 	}
 	for topic, d := range discoveryData {
-		topic = fmt.Sprintf(topic, m.haDiscoveryPrefix, vin)
+		topic = fmt.Sprintf(topic, discoveryPrefix, vin)
 		for in, out := range mappings {
 			d = strings.Replace(d, in, out, -1)
 		}
-		if token := m.client.Publish(topic, 1, true, d); token.Wait() && token.Error() != nil {
-			log.Error( token.Error() )
-		}
-		//m.client.Publish(topic, 0, false, "{}")
+		m.mqttPublish(topic, 1, true, d)
 	}
 }
 
@@ -963,6 +1057,10 @@ func init() {
 	mqttCmd.Flags().Duration("wifi_restart_time", 0, "Attempt to restart Wifi if no connection for this long")
 	mqttCmd.Flags().Duration("wifi_restart_retry_time", 2*time.Minute, "Interval to attempt Wifi restart")
 	mqttCmd.Flags().String("wifi_restart_command", defaultWifiRestartCmd, "Command to restart Wifi connection to Phev")
+	mqttCmd.Flags().String("wifi_interface", "wlan0", "WiFi interface for the car, as managed by the web interface")
+	// web_password and web_settings_file only come from the config file, so
+	// the password never shows up in the process list.
+	mqttCmd.Flags().String("web_listen", "", "Serve the web interface on this address, e.g. 127.0.0.1:8080 (off if empty)")
 
 	viper.BindPFlag("mqtt_server", mqttCmd.Flags().Lookup("mqtt_server"))
 	viper.BindPFlag("mqtt_username", mqttCmd.Flags().Lookup("mqtt_username"))
@@ -972,6 +1070,8 @@ func init() {
 	viper.BindPFlag("ha_discovery", mqttCmd.Flags().Lookup("ha_discovery"))
 	viper.BindPFlag("ha_discovery_prefix", mqttCmd.Flags().Lookup("ha_discovery_prefix"))
 	viper.BindPFlag("update_interval", mqttCmd.Flags().Lookup("update_interval"))
+	viper.BindPFlag("wifi_interface", mqttCmd.Flags().Lookup("wifi_interface"))
+	viper.BindPFlag("web_listen", mqttCmd.Flags().Lookup("web_listen"))
 	viper.BindPFlag("wifi_restart_time", mqttCmd.Flags().Lookup("wifi_restart_time"))
 	viper.BindPFlag("wifi_restart_retry_time", mqttCmd.Flags().Lookup("wifi_restart_retry_time"))
 	viper.BindPFlag("wifi_restart_command", mqttCmd.Flags().Lookup("wifi_restart_command"))

@@ -27,3 +27,14 @@ wifi_restart_command: "ip link set wlan0 down && sleep 3 && ip link set wlan0 up
 
 # Ignore all set/... commands from MQTT (lights, climate, registers).
 # mqtt_disable_register_set_command: false
+
+# Web interface: status, buttons for the car, MQTT and WiFi settings and the
+# log. Off unless web_listen is set. Anywhere but localhost it needs
+# web_password (basic auth; any user name). MQTT settings saved there go to
+# /var/lib/phev2mqtt/settings.yaml and override the ones above.
+# web_listen: "127.0.0.1:8080"
+# web_listen: ":8080"
+# web_password: ""
+# WiFi interface for the car, as managed by the web interface (needs
+# NetworkManager).
+# wifi_interface: wlan0

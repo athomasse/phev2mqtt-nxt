@@ -21,6 +21,10 @@ depends:
   - systemd | systemd-standalone-sysusers
 recommends:
   - iproute2
+# For the WiFi settings in the web interface.
+suggests:
+  - network-manager
+  - polkitd
 
 contents:
   - src: dist/phev2mqtt
@@ -29,6 +33,8 @@ contents:
     dst: /usr/lib/systemd/system/phev2mqtt.service
   - src: packaging/sysusers.conf
     dst: /usr/lib/sysusers.d/phev2mqtt.conf
+  - src: packaging/polkit.rules
+    dst: /usr/share/polkit-1/rules.d/50-phev2mqtt.rules
   # A conffile: an upgrade never overwrites local changes. The group is set
   # in postinstall, because the user does not exist yet while unpacking.
   - src: packaging/config.yaml

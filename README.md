@@ -166,6 +166,23 @@ The following topics are subscribed to and can be used to change state on the ca
 | phev/set/climate/state | `[payload]=reset` clears "terminated" state |
 | phev/connection | Change car connection state to (on/off/restart) |
 
+#### Web interface
+
+An optional web interface shows the car's status and the log, has buttons for the
+climate, lights, charge timer and (re)connecting, and lets you set up MQTT and the car's
+WiFi. It is off unless `web_listen` is set in the config file:
+
+```
+web_listen: ":8080"        # or "127.0.0.1:8080" for local access only
+web_password: "something long"   # required unless listening on localhost
+```
+
+Log in with any user name and that password. MQTT settings saved in the web interface
+go to `/var/lib/phev2mqtt/settings.yaml` (with the package) and override the config file.
+The WiFi settings need NetworkManager; the package ships a polkit rule that lets only the
+`phev2mqtt` service manage WiFi connections. Setting raw registers is not possible from
+the web interface.
+
 #### Home Assistant discovery
 
 The client supports [Home Assistant MQTT Discovery](https://www.home-assistant.io/docs/mqtt/discovery/) by default.

@@ -13,6 +13,9 @@ ExecStart=/usr/bin/phev2mqtt --config /etc/phev2mqtt/config.yaml client mqtt
 Restart=always
 RestartSec=30s
 SyslogIdentifier=phev2mqtt
+# Settings saved by the web interface: /var/lib/phev2mqtt/settings.yaml.
+StateDirectory=phev2mqtt
+StateDirectoryMode=0700
 
 # wifi_restart_command (ip link set ... down/up) needs CAP_NET_ADMIN and
 # nothing else, so no sudo. NoNewPrivileges means sudo would not work anyway.

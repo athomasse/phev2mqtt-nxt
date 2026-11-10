@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"encoding/json"
+	"sync"
 	"testing"
 	"time"
 
@@ -10,19 +11,6 @@ import (
 	"github.com/buxtronix/phev2mqtt/client"
 	"github.com/buxtronix/phev2mqtt/protocol"
 )
-
-type fakeMessage struct {
-	topic   string
-	payload string
-}
-
-func (f fakeMessage) Duplicate() bool   { return false }
-func (f fakeMessage) Qos() byte         { return 0 }
-func (f fakeMessage) Retained() bool    { return false }
-func (f fakeMessage) Topic() string     { return f.topic }
-func (f fakeMessage) MessageID() uint16 { return 0 }
-func (f fakeMessage) Payload() []byte   { return []byte(f.payload) }
-func (f fakeMessage) Ack()              {}
 
 type fakeToken struct{}
 
@@ -38,13 +26,18 @@ func (fakeToken) Error() error { return nil }
 // fakeBroker records publishes; any other mqtt.Client method panics.
 type fakeBroker struct {
 	mqtt.Client
+	mu        sync.Mutex
 	published map[string]string
 }
 
 func (f *fakeBroker) Publish(topic string, qos byte, retained bool, payload interface{}) mqtt.Token {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.published[topic] = payload.(string)
 	return fakeToken{}
 }
+
+func (f *fakeBroker) IsConnected() bool { return true }
 
 func newTestClient(prefix string) (*mqttClient, *fakeBroker) {
 	b := &fakeBroker{published: map[string]string{}}
@@ -53,8 +46,8 @@ func newTestClient(prefix string) (*mqttClient, *fakeBroker) {
 		prefix:            prefix,
 		haDiscovery:       true,
 		haDiscoveryPrefix: "homeassistant",
-		mqttData:          map[string]string{},
 		climate:           new(climate),
+		state:             newGatewayState(),
 	}, b
 }
 
@@ -66,8 +59,8 @@ func handle(t *testing.T, m *mqttClient, my client.ModelYear, topic, payload str
 	if err != nil {
 		t.Fatal(err)
 	}
-	cl.ModelYear = my
-	m.phev = cl
+	m.state.setCar(cl)
+	m.state.setConnected(true, my)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
