@@ -24,10 +24,11 @@ jobs:
         with:
           go-version: stable
 
-      # -vet=off: the upstream code has a few printf/unreachable-code findings
-      # that make `go test` fail in cmd/ and emulator/. Drop it once fixed.
+      - name: Vet
+        run: go vet ./...
+
       - name: Test
-        run: go test -vet=off ./...
+        run: go test -race ./...
 
       - name: Build linux/armv6
         env:
