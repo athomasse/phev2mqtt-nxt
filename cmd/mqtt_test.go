@@ -147,7 +147,7 @@ func TestClimateMode(t *testing.T) {
 }
 
 // Every state_topic in the Home Assistant discovery must be one that
-// publishRegister actually publishes.
+// publishRegister, the car loop or watchWifi actually publishes.
 func TestDiscoveryStateTopicsArePublished(t *testing.T) {
 	published := map[string]bool{}
 	for _, topic := range []string{
@@ -155,6 +155,8 @@ func TestDiscoveryStateTopicsArePublished(t *testing.T) {
 		"/door/driver", "/door/rear_left", "/door/rear_right",
 		"/battery/level", "/charge/remaining", "/charge/plug", "/charge/charging",
 		"/lights/parking", "/lights/head", "/lights/interior", "/lights/hazard",
+		"/available", "/connection/last_connected", "/connection/last_disconnected",
+		"/wifi/state", "/wifi/signal",
 	} {
 		published["~"+topic] = true
 	}
@@ -163,7 +165,7 @@ func TestDiscoveryStateTopicsArePublished(t *testing.T) {
 	}
 
 	m, b := newTestClient("phev")
-	m.publishHomeAssistantDiscovery("VIN123", "phev", "Phev")
+	m.publishHomeAssistantDiscovery("VIN123", "phev")
 	if len(b.published) == 0 {
 		t.Fatal("no discovery published")
 	}

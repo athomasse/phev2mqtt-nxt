@@ -12,6 +12,8 @@ mqtt_password: ""
 # Home Assistant MQTT discovery.
 # ha_discovery: true
 # ha_discovery_prefix: homeassistant
+# Name of the car in Home Assistant (default "PHEV <VIN>").
+# ha_device_name: "Outlander"
 
 # The car's own WiFi always serves this address.
 # address: "192.168.8.46:8080"
@@ -37,6 +39,6 @@ wifi_restart_command: "ip link set wlan0 down && sleep 3 && ip link set wlan0 up
 # web_password: ""
 # Or no login at all. Anyone who can reach web_listen then controls the car.
 # web_auth: false
-# WiFi interface for the car, as managed by the web interface (needs
-# NetworkManager).
+# WiFi interface for the car. Its state and signal go to MQTT (phev/wifi/...);
+# the web interface manages it, which needs NetworkManager.
 # wifi_interface: wlan0

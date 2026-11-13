@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode"
 
 	log "github.com/sirupsen/logrus"
 )
@@ -61,6 +62,7 @@ func newWebServer(m *mqttClient, listen, password string, auth bool) (*webServer
 	mux.HandleFunc("POST /api/command", ws.command)
 	mux.HandleFunc("GET /api/mqtt", ws.getMQTT)
 	mux.HandleFunc("POST /api/mqtt", ws.setMQTT)
+	mux.HandleFunc("POST /api/device_name", ws.setDeviceName)
 	mux.HandleFunc("GET /api/wifi", ws.getWifi)
 	mux.HandleFunc("POST /api/wifi/scan", ws.scanWifi)
 	mux.HandleFunc("POST /api/wifi", ws.setWifi)
@@ -146,7 +148,8 @@ type webState struct {
 	stateSnapshot
 	MQTTConnected bool   `json:"mqtt_connected"`
 	MQTTServer    string `json:"mqtt_server"`
-	Version       string `json:"version"`
+	Version       string `json:"version"` // The release.
+	Build         string `json:"build"`
 }
 
 func (ws *webServer) currentState() webState {
@@ -154,7 +157,8 @@ func (ws *webServer) currentState() webState {
 		stateSnapshot: ws.m.state.snapshot(),
 		MQTTConnected: ws.m.mqttConnected(),
 		MQTTServer:    cfgString("mqtt_server"),
-		Version:       Version,
+		Version:       releaseVersion(),
+		Build:         Version,
 	}
 }
 
@@ -238,6 +242,13 @@ func (ws *webServer) command(w http.ResponseWriter, r *http.Request) {
 				log.Infof("Error requesting update: %v", err)
 			}
 		}()
+	case "restart":
+		log.Info("Web interface: restart")
+		go func() {
+			// Lets this answer reach the browser first.
+			time.Sleep(500 * time.Millisecond)
+			ws.m.restart()
+		}()
 	case "wifi_restart":
 		go func() {
 			if err := runWifiRestart(); err != nil {
@@ -291,6 +302,7 @@ type mqttSettings struct {
 	TopicPrefix       string `json:"topic_prefix"`
 	HADiscovery       bool   `json:"ha_discovery"`
 	HADiscoveryPrefix string `json:"ha_discovery_prefix"`
+	DeviceName        string `json:"device_name"`
 	Connected         bool   `json:"connected"`
 	SettingsFile      string `json:"settings_file"`
 }
@@ -304,6 +316,7 @@ func (ws *webServer) getMQTT(w http.ResponseWriter, r *http.Request) {
 		TopicPrefix:       cfgString("mqtt_topic_prefix"),
 		HADiscovery:       cfgBool("ha_discovery"),
 		HADiscoveryPrefix: cfgString("ha_discovery_prefix"),
+		DeviceName:        cfgString("ha_device_name"),
 		Connected:         ws.m.mqttConnected(),
 		SettingsFile:      webSettingsFile(),
 	})
@@ -348,6 +361,30 @@ func (ws *webServer) setMQTT(w http.ResponseWriter, r *http.Request) {
 	log.Infof("Web interface: MQTT settings changed, reconnecting to %s", req.Server)
 	go ws.m.connectMQTT()
 	ws.getMQTT(w, r)
+}
+
+// setDeviceName renames the car in Home Assistant, without reconnecting.
+// Home Assistant keeps a name given in its own interface over this one.
+func (ws *webServer) setDeviceName(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := readJSON(w, r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	name := strings.TrimSpace(req.Name)
+	if len([]rune(name)) > 64 || strings.IndexFunc(name, unicode.IsControl) >= 0 {
+		writeError(w, http.StatusBadRequest, errors.New("the name must be at most 64 characters, on one line"))
+		return
+	}
+	if err := saveWebSettings(map[string]interface{}{"ha_device_name": name}); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	log.Infof("Web interface: name in Home Assistant now %q", deviceName(name, ws.m.state.getVIN()))
+	published := ws.m.renameDevice(name)
+	writeJSON(w, http.StatusOK, map[string]interface{}{"name": name, "published": published})
 }
 
 func validateBrokerURL(s string) error {

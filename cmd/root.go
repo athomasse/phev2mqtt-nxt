@@ -36,6 +36,18 @@ var (
 // -ldflags "-X github.com/buxtronix/phev2mqtt/cmd.Version=...".
 var Version = "dev"
 
+// Release is the GitHub release (its tag without the v) this build is, or
+// builds on; set like Version. The web interface shows it.
+var Release = ""
+
+// releaseVersion is Release, or Version when the build did not set it.
+func releaseVersion() string {
+	if Release != "" {
+		return Release
+	}
+	return Version
+}
+
 // rootCmd represents the base command when called without any subcommands
 var rootCmd = &cobra.Command{
 	Use:     "phev2mqtt",

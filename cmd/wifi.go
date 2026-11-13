@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	log "github.com/sirupsen/logrus"
 )
 
 // The NetworkManager profile the web interface manages for the car's WiFi.
@@ -198,6 +200,29 @@ func (w *wifiManager) connectCar(ssid, psk, mac string) error {
 			return err
 		}
 	}
-	_, err := nmcli("connection", "up", carConnectionName)
-	return err
+	if _, err := nmcli("connection", "up", carConnectionName); err != nil {
+		log.Debugf("nmcli connection up: %v", err)
+		return connectError(ssid, err)
+	}
+	return nil
+}
+
+// connectError turns what nmcli says about a failed connection into one
+// line that says what to do. NetworkManager reports a password the car
+// refused as missing secrets, since it then asks for a new one.
+func connectError(ssid string, err error) error {
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "Secrets were required"):
+		return fmt.Errorf("the car refused the WiFi password for %q; check it, letters like l, I and 1 or 0 and O look alike", ssid)
+	case strings.Contains(msg, "No network with SSID"):
+		return fmt.Errorf("WiFi %q not found; is the car within range and its WiFi on?", ssid)
+	case strings.Contains(msg, "Timeout") || strings.Contains(msg, "timed out") || strings.Contains(msg, "deadline exceeded"):
+		return fmt.Errorf("no connection to %q within %v; the signal may be too weak", ssid, nmcliTimeout)
+	case strings.Contains(msg, "Not authorized") || strings.Contains(msg, "Insufficient privileges"):
+		return errors.New("not allowed to manage the WiFi; is the polkit rule of the package installed?")
+	}
+	// Otherwise the first line, without nmcli's "Error: " and its hints.
+	line, _, _ := strings.Cut(msg, "\n")
+	return errors.New(strings.TrimPrefix(line, "Error: "))
 }
