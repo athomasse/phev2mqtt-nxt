@@ -7,6 +7,9 @@ set -eu
 
 version=$1
 cd "$(dirname "$0")/.."
+# The GitHub release this build is or builds on, for the web interface.
+release=$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || echo "v$version")
+release=${release#v}
 rm -rf dist
 mkdir -p dist
 
@@ -14,7 +17,7 @@ mkdir -p dist
 build() {
 	echo "== linux/$3 ($4)"
 	CGO_ENABLED=0 GOOS=linux GOARCH=$1 GOARM=$2 go build -trimpath \
-		-ldflags "-s -w -X github.com/buxtronix/phev2mqtt/cmd.Version=$version" \
+		-ldflags "-s -w -X github.com/buxtronix/phev2mqtt/cmd.Version=$version -X github.com/buxtronix/phev2mqtt/cmd.Release=$release" \
 		-o "dist/phev2mqtt-linux-$3" .
 	# nfpm does not expand variables in contents, so use a fixed path.
 	cp "dist/phev2mqtt-linux-$3" dist/phev2mqtt

@@ -79,6 +79,7 @@ input, select {
 }
 #log .warning { color: var(--warn); } #log .error, #log .fatal, #log .panic { color: var(--bad); }
 #log .debug, #log .trace { color: var(--muted); }
+#log.errors-only > :not(.error):not(.fatal):not(.panic) { display: none; }
 </style>
 </head>
 <body>
@@ -125,6 +126,7 @@ input, select {
       <button data-cmd="connection" data-value="restart">Reconnect to car</button>
       <button data-cmd="connection" id="toggle-connection">Disconnect</button>
       <button data-cmd="wifi_restart" title="Runs wifi_restart_command">Restart WiFi</button>
+      <button id="restart" type="button" title="Starts phev2mqtt afresh">Restart phev2mqtt</button>
     </div>
     <div class="msg" id="cmd-msg"></div>
   </section>
@@ -144,6 +146,11 @@ input, select {
       </form>
       <div class="msg" id="mqtt-msg"></div>
       <div class="muted" id="mqtt-file"></div>
+      <form id="name-form" class="form" style="margin-top:12px">
+        <label>Name in Home Assistant<input name="name" maxlength="64" autocomplete="off"></label>
+        <div class="row"><button type="submit">Rename</button></div>
+      </form>
+      <div class="msg" id="name-msg"></div>
     </section>
 
     <section>
@@ -164,7 +171,9 @@ input, select {
   <section>
     <div class="row">
       <h2 style="margin:0">Log</h2>
-      <label class="check" style="margin-left:auto"><input type="checkbox" id="autoscroll" checked> Follow</label>
+      <label class="check" style="margin-left:auto"><input type="checkbox" id="errors-only"> Errors only</label>
+      <label class="check"><input type="checkbox" id="autoscroll" checked> Follow</label>
+      <button id="log-clear" type="button">Clear</button>
     </div>
     <div id="log"></div>
   </section>
@@ -228,12 +237,15 @@ function tiles(st) {
     ["VIN", st.vin],
     ["Last update", st.updated ? ago(st.updated) : undefined],
     ["Last connected", st.car_connected ? "now" : ago(st.last_connect)],
+    ["WiFi", v("/wifi/state") === "connected" && v("/wifi/signal") !== undefined
+      ? "connected, " + v("/wifi/signal") + " dBm" : v("/wifi/state")],
   ];
 }
 
 function render(st) {
   state = st;
   $("version").textContent = st.version;
+  $("version").title = st.build !== st.version ? "Build " + st.build : "";
   const car = $("pill-car");
   car.textContent = "Car: " + (!st.enabled ? "disabled" : st.car_connected ? "connected" : "not connected");
   car.className = "pill " + (st.car_connected ? "ok" : st.enabled ? "bad" : "warn");
@@ -269,6 +281,37 @@ for (const b of document.querySelectorAll("button[data-cmd]")) {
   });
 }
 
+// Asks for a second click instead of confirm(), which may be blocked.
+let restartArmed;
+$("restart").addEventListener("click", async (ev) => {
+  const b = ev.target;
+  if (!restartArmed) {
+    b.textContent = "Click again to restart";
+    restartArmed = setTimeout(() => { restartArmed = undefined; b.textContent = "Restart phev2mqtt"; }, 5000);
+    return;
+  }
+  clearTimeout(restartArmed);
+  restartArmed = undefined;
+  b.textContent = "Restart phev2mqtt";
+  try {
+    await api("/api/command", { command: "restart" });
+    say("cmd-msg", "Restarting; the page reconnects by itself.", true);
+  } catch (e) {
+    say("cmd-msg", e.message, false);
+  }
+});
+
+$("name-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  try {
+    const r = await api("/api/device_name", { name: ev.target.name.value.trim() });
+    say("name-msg", r.published ? "Renamed in Home Assistant."
+      : "Saved; Home Assistant gets it once the car has connected.", true);
+  } catch (e) {
+    say("name-msg", e.message, false);
+  }
+});
+
 async function loadMQTT() {
   const s = await api("/api/mqtt");
   const f = $("mqtt-form");
@@ -277,6 +320,9 @@ async function loadMQTT() {
   f.ha_discovery.checked = s.ha_discovery;
   f.password.value = ""; f.clear_password.checked = false;
   f.password.placeholder = s.password_set ? "unchanged" : "";
+  const n = $("name-form");
+  n.name.value = s.device_name;
+  n.name.placeholder = "PHEV " + (state && state.vin ? state.vin : "<VIN>");
   $("mqtt-file").textContent = s.settings_file ? "Saved in " + s.settings_file + ", on top of the config file." : "";
 }
 
@@ -364,9 +410,21 @@ $("wifi-form").addEventListener("submit", async (ev) => {
   }
 });
 
+// The server sends its whole log again on every connection, so Clear
+// remembers up to which line it cleared. After a restart the numbering
+// starts again: the first batch then ends below what was seen before.
+let clearedSeq = 0, lastSeq = 0, freshConnection = false;
+
 function addLog(lines) {
   const box = $("log");
+  if (freshConnection && lines.length) {
+    if (lines[lines.length - 1].seq < lastSeq) clearedSeq = 0;
+    freshConnection = false;
+    lastSeq = 0;
+  }
   for (const l of lines) {
+    lastSeq = Math.max(lastSeq, l.seq);
+    if (l.seq <= clearedSeq) continue;
     const div = document.createElement("div");
     div.className = l.level;
     const t = new Date(l.time).toLocaleTimeString([], { hour12: false });
@@ -377,10 +435,26 @@ function addLog(lines) {
   if ($("autoscroll").checked) box.scrollTop = box.scrollHeight;
 }
 
+$("log-clear").addEventListener("click", () => {
+  clearedSeq = lastSeq;
+  $("log").replaceChildren();
+});
+
+// Remembered per browser; storage may be unavailable.
+const errorsOnly = $("errors-only");
+try { errorsOnly.checked = localStorage.getItem("phev2mqtt-errors-only") === "1"; } catch (e) {}
+const applyErrorsOnly = () => {
+  $("log").classList.toggle("errors-only", errorsOnly.checked);
+  try { localStorage.setItem("phev2mqtt-errors-only", errorsOnly.checked ? "1" : "0"); } catch (e) {}
+};
+errorsOnly.addEventListener("change", applyErrorsOnly);
+applyErrorsOnly();
+
 function connect() {
   const es = new EventSource("/api/events");
   const page = $("pill-page");
-  es.addEventListener("open", () => { page.hidden = true; });
+  // Every connection starts with the whole log again (also after a restart).
+  es.addEventListener("open", () => { page.hidden = true; $("log").replaceChildren(); freshConnection = true; });
   es.addEventListener("state", (ev) => render(JSON.parse(ev.data)));
   es.addEventListener("log", (ev) => addLog(JSON.parse(ev.data)));
   es.addEventListener("error", () => {

@@ -131,6 +131,10 @@ The following topics are published:
 |---|---|
 | phev/register/[register] | Raw values of each register, as hex strings |
 | phev/available | Wifi connection status to car. *online* or *offline* |
+| phev/connection/last_connected | When the connection to the car was last made (RFC 3339) |
+| phev/connection/last_disconnected | When the connection to the car was last lost (RFC 3339) |
+| phev/wifi/state | The car's WiFi interface (`wifi_interface`): *connected* or *disconnected* |
+| phev/wifi/signal | Its signal level in dBm, while connected |
 | phev/battery/level | Current drive battery level as a percent |
 | phev/climate/status | Whether the car AC is on |
 | phev/climate/mode | Mode of the AC, if on. *cool*, *heat*, *windscreen* |
@@ -165,6 +169,7 @@ The following topics are subscribed to and can be used to change state on the ca
 | phev/set/climate/[mode] | Set ac/climate state (cool/heat/windscreen/off) for [payload] minutes (10/20/30[on]) |
 | phev/set/climate/state | `[payload]=reset` clears "terminated" state |
 | phev/connection | Change car connection state to (on/off/restart) |
+| phev/restart | Restart phev2mqtt itself (any payload; retained messages are ignored) |
 
 #### Web interface
 
@@ -192,6 +197,16 @@ The client supports [Home Assistant MQTT Discovery](https://www.home-assistant.i
 After initial discovery, re-run the binary for the entities to appear. You can
 search for "phev" in your entity list. Your car should also appear as a device
 in the Devices tab.
+
+Besides the car's own entities there are a connection sensor, which stays available and
+shows the car being away, and diagnostic sensors for the WiFi, its signal and when the car
+last connected and disconnected. The WiFi state comes from the kernel as it changes and the
+signal is what the WiFi adapter measured from the car anyway, so none of these send anything
+to the car or poll. The signal is updated with each status update (`update_interval`).
+
+The car shows up as the device *PHEV &lt;VIN&gt;*; `ha_device_name` (or the web
+interface, without reconnecting) gives it another name, which Home Assistant puts in front
+of every entity name. A name given in Home Assistant itself takes precedence.
 
 You can disable this with `--ha_discovery=false` or change the discovery prefix, the default is `--ha_discovery_prefix=homeassistant`.
 

@@ -46,6 +46,7 @@ var webSettingKeys = []string{
 	"mqtt_topic_prefix",
 	"ha_discovery",
 	"ha_discovery_prefix",
+	"ha_device_name",
 }
 
 // webSettingsFile is web_settings_file, else settings.yaml in the systemd

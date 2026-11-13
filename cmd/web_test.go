@@ -296,3 +296,79 @@ func TestWebEvents(t *testing.T) {
 		}
 	}
 }
+
+func TestDiscoveryDeviceName(t *testing.T) {
+	for _, tc := range []struct{ name, want string }{
+		{"", "PHEV VIN1"},
+		{`My "Outlander"`, `My "Outlander"`},
+	} {
+		m, b := newTestClient("phev")
+		m.haDeviceName = tc.name
+		m.publishHomeAssistantDiscovery("VIN1", "phev")
+		for topic, payload := range b.published {
+			var config struct {
+				Name   string `json:"name"`
+				Device struct {
+					Name string `json:"name"`
+				} `json:"dev"`
+				LongDevice struct {
+					Name string `json:"name"`
+				} `json:"device"`
+			}
+			if err := json.Unmarshal([]byte(payload), &config); err != nil {
+				t.Errorf("%s: invalid JSON with name %q: %v", topic, tc.name, err)
+				continue
+			}
+			if got := config.Device.Name + config.LongDevice.Name; got != tc.want {
+				t.Errorf("%s: device name %q, want %q", topic, got, tc.want)
+			}
+			// Home Assistant puts the device name in front itself.
+			if strings.HasPrefix(config.Name, "Phev ") || strings.HasPrefix(config.Name, "PHEV ") {
+				t.Errorf("%s: entity name %q repeats the device name", topic, config.Name)
+			}
+		}
+	}
+}
+
+func TestWebDeviceName(t *testing.T) {
+	setConfig(t, "web_settings_file", filepath.Join(t.TempDir(), "settings.yaml"))
+	ws, m := newTestWeb(t, "")
+	b := m.client.(*fakeBroker)
+	m.state.setVIN("VIN1")
+
+	rec := request(t, ws, "POST", "/api/device_name", `{"name":"  Outlander "}`, "", true)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"published":true`) {
+		t.Fatalf("rename: got %d (%s)", rec.Code, rec.Body)
+	}
+	if got := cfgString("ha_device_name"); got != "Outlander" {
+		t.Errorf("ha_device_name = %q, want Outlander", got)
+	}
+	if d := b.published["homeassistant/sensor/VIN1_battery_level/config"]; !strings.Contains(d, `"name": "Outlander"`) {
+		t.Errorf("discovery not republished with the new name: %s", d)
+	}
+	for _, bad := range []string{`{"name":"two\nlines"}`, `{"name":"` + strings.Repeat("x", 65) + `"}`} {
+		if rec := request(t, ws, "POST", "/api/device_name", bad, "", true); rec.Code != http.StatusBadRequest {
+			t.Errorf("%s: got %d, want 400", bad, rec.Code)
+		}
+	}
+}
+
+func TestWebStateShowsRelease(t *testing.T) {
+	oldVersion, oldRelease := Version, Release
+	t.Cleanup(func() { Version, Release = oldVersion, oldRelease })
+	ws, _ := newTestWeb(t, "")
+
+	Version, Release = "0.0.0~git20261113120000.abc1234", "0.4.0"
+	var st webState
+	json.Unmarshal(request(t, ws, "GET", "/api/state", "", "", false).Body.Bytes(), &st)
+	if st.Version != "0.4.0" || st.Build != Version {
+		t.Errorf("version %q build %q; want the release and the full build", st.Version, st.Build)
+	}
+
+	// A build without a release number still shows something.
+	Version, Release = "dev", ""
+	json.Unmarshal(request(t, ws, "GET", "/api/state", "", "", false).Body.Bytes(), &st)
+	if st.Version != "dev" {
+		t.Errorf("version %q, want dev", st.Version)
+	}
+}

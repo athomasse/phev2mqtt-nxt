@@ -17,6 +17,7 @@ along with this program. If not, see <http://www.gnu.org/licenses/>.
 package cmd
 
 import (
+	"encoding/json"
 	"bytes"
 	"context"
 	"encoding/hex"
@@ -144,6 +145,8 @@ type mqttClient struct {
 	updateInterval time.Duration
 	lastError      error
 	climate        *climate
+	// The car's WiFi interface (wifi_interface); set before anything runs.
+	wifiIface string
 
 	// Shared with the MQTT callbacks and the web interface.
 	state *gatewayState
@@ -156,6 +159,7 @@ type mqttClient struct {
 	prefix               string
 	haDiscovery          bool
 	haDiscoveryPrefix    string
+	haDeviceName         string
 	haPublishedDiscovery bool
 }
 
@@ -217,6 +221,7 @@ func (m *mqttClient) connectMQTT() {
 	m.prefix = cfgString("mqtt_topic_prefix")
 	m.haDiscovery = cfgBool("ha_discovery")
 	m.haDiscoveryPrefix = cfgString("ha_discovery_prefix")
+	m.haDeviceName = cfgString("ha_device_name")
 	m.haPublishedDiscovery = false
 	m.mqttMu.Unlock()
 	if old != nil {
@@ -236,7 +241,7 @@ func (m *mqttClient) connectMQTT() {
 	// (re)connection - a broker restart silently drops both.
 	onConnect := func(mqtt_client mqtt.Client) {
 		log.Info("Connected to MQTT broker")
-		topics := []string{m.topic("/connection"), m.topic("/settings/#"), m.haStatusTopic()}
+		topics := []string{m.topic("/connection"), m.topic("/restart"), m.topic("/settings/#"), m.haStatusTopic()}
 		if !disableSet {
 			topics = append(topics, m.topic("/set/#"))
 		}
@@ -250,6 +255,13 @@ func (m *mqttClient) connectMQTT() {
 			availability = "online"
 		}
 		mqtt_client.Publish(m.topic("/available"), 0, true, availability)
+		// A broker without persistence forgets retained values on restart.
+		for _, t := range []string{"/connection/last_connected", "/connection/last_disconnected"} {
+			if v := m.state.value(t); v != "" {
+				mqtt_client.Publish(m.topic(t), 0, true, v)
+			}
+		}
+		m.publishWifi(m.wifiIface)
 		m.mqttMu.Lock()
 		m.haPublishedDiscovery = false
 		m.mqttMu.Unlock()
@@ -310,7 +322,11 @@ func (m *mqttClient) Run(cmd *cobra.Command, args []string) error {
 		go web.serve()
 	}
 
+	m.wifiIface = cfgString("wifi_interface")
 	m.connectMQTT()
+	if m.wifiIface != "" {
+		go m.watchWifi(m.wifiIface)
+	}
 
 	for {
 		if m.state.isEnabled() {
@@ -343,7 +359,36 @@ func (m *mqttClient) republishDiscovery() {
 	if vin == "" {
 		return
 	}
-	m.publishHomeAssistantDiscovery(vin, m.topic(""), "Phev")
+	m.publishHomeAssistantDiscovery(vin, m.topic(""))
+}
+
+// renameDevice gives the car another name in Home Assistant ("" for the
+// default) and republishes the discovery. It reports false when that has to
+// wait for the car's VIN, which comes with the first connection.
+func (m *mqttClient) renameDevice(name string) bool {
+	m.mqttMu.Lock()
+	m.haDeviceName = name
+	m.haPublishedDiscovery = false
+	m.mqttMu.Unlock()
+	if m.state.getVIN() == "" || !m.mqttConnected() {
+		return false
+	}
+	m.republishDiscovery()
+	return true
+}
+
+// deviceName is the name of the car in Home Assistant.
+func deviceName(name, vin string) string {
+	if name == "" {
+		return "PHEV " + vin
+	}
+	return name
+}
+
+// jsonString escapes s for use inside a JSON string.
+func jsonString(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b[1 : len(b)-1])
 }
 
 func (m *mqttClient) publish(topic, payload string) {
@@ -371,7 +416,7 @@ func (m *mqttClient) handleIncomingMqtt(mqtt_client mqtt.Client, msg mqtt.Messag
 	// it on every connection attempt.
 	phev := m.state.car()
 	haStatus := m.haStatusTopic()
-	if phev == nil && msg.Topic() != haStatus && msg.Topic() != m.topic("/connection") {
+	if phev == nil && msg.Topic() != haStatus && msg.Topic() != m.topic("/connection") && msg.Topic() != m.topic("/restart") {
 		log.Infof("Not connected to the car yet, ignoring [%s]", msg.Topic())
 		return
 	}
@@ -388,6 +433,14 @@ func (m *mqttClient) handleIncomingMqtt(mqtt_client mqtt.Client, msg mqtt.Messag
 				m.mqttPublish(m.topic("/available"), 0, true, "online")
 			}
 		}
+	} else if msg.Topic() == m.topic("/restart") {
+		// A retained one would restart every new start again.
+		if msg.Retained() {
+			log.Warnf("Ignoring retained [%s]; clear it on the broker", msg.Topic())
+			return
+		}
+		// Not in this callback: restart waits for the broker.
+		go m.restart()
 	} else if strings.HasPrefix(msg.Topic(), m.topic("/set/register/")) {
 		// Strip the prefix instead of splitting the whole topic: the prefix
 		// itself may contain slashes (e.g. "home/phev").
@@ -549,10 +602,15 @@ func (m *mqttClient) handlePhev(cmd *cobra.Command) error {
 	// ModelYear is set before Start returns; later changes would race.
 	m.state.setConnected(true, phev.ModelYear)
 	m.mqttPublish(m.topic("/available"), 0, true, "online")
+	m.publishRetained("/connection/last_connected", time.Now().Format(time.RFC3339))
+	m.publishWifiSignal(m.wifiIface)
 
 	m.lastError = nil
 
-	defer m.state.setConnected(false, client.ModelYearUnknown)
+	defer func() {
+		m.state.setConnected(false, client.ModelYearUnknown)
+		m.publishRetained("/connection/last_disconnected", time.Now().Format(time.RFC3339))
+	}()
 
 	var encodingErrorCount = 0
 	var lastEncodingError time.Time
@@ -561,6 +619,7 @@ func (m *mqttClient) handlePhev(cmd *cobra.Command) error {
 	for {
 		select {
 		case <-updaterTicker.C:
+			m.publishWifiSignal(m.wifiIface)
 			// Not inline: SetRegister waits up to 10s for the ack, which the
 			// reader can only deliver while this loop keeps draining Recv.
 			go func(phev *client.Client) {
@@ -621,7 +680,7 @@ func (m *mqttClient) publishRegister(msg *protocol.PhevMessage) {
 	case *protocol.RegisterVIN:
 		m.state.setVIN(reg.VIN)
 		m.publish("/vin", reg.VIN)
-		m.publishHomeAssistantDiscovery(reg.VIN, m.topic(""), "Phev")
+		m.publishHomeAssistantDiscovery(reg.VIN, m.topic(""))
 		m.publish("/registrations", fmt.Sprintf("%d", reg.Registrations))
 	case *protocol.RegisterECUVersion:
 		m.publish("/ecuversion", reg.Version)
@@ -681,7 +740,7 @@ func (m *mqttClient) publishRegister(msg *protocol.PhevMessage) {
 
 // Publish home assistant discovery message.
 // Uses the vehicle VIN, so sent after VIN discovery.
-func (m *mqttClient) publishHomeAssistantDiscovery(vin, topic, name string) {
+func (m *mqttClient) publishHomeAssistantDiscovery(vin, topic string) {
 
 	// Only to a connected broker: onConnect publishes it again anyway, and
 	// waiting for 20+ publish timeouts would stall the car loop.
@@ -692,47 +751,48 @@ func (m *mqttClient) publishHomeAssistantDiscovery(vin, topic, name string) {
 	}
 	m.haPublishedDiscovery = true
 	discoveryPrefix := m.haDiscoveryPrefix
+	device := deviceName(m.haDeviceName, vin)
 	m.mqttMu.Unlock()
 	discoveryData := map[string]string{
 		// Doors.
 		"%s/binary_sensor/%s_door_locked/config": `{
 		"device_class": "lock",
-		"name": "__NAME__ Locked",
+		"name": "Locked",
 		"state_topic": "~/door/locked",
 		"payload_off": "closed",
 		"payload_on": "open",
 		"avty_t": "~/available",
 		"unique_id": "__VIN___door_locked",
 		"device": {
-			"name": "PHEV __VIN__",
+			"name": "__DEVICE__",
 			"identifiers": ["phev-__VIN__"],
 			"manufacturer": "Mitsubishi",
 			"model": "Outlander PHEV"},
 		"~": "__TOPIC__"}`,
 		"%s/binary_sensor/%s_door_bonnet/config": `{
 		"device_class": "door",
-		"name": "__NAME__ Bonnet",
+		"name": "Bonnet",
 		"state_topic": "~/door/bonnet",
 		"payload_off": "closed",
 		"payload_on": "open",
 		"avty_t": "~/available",
 		"unique_id": "__VIN___door_bonnet",
 		"device": {
-			"name": "PHEV __VIN__",
+			"name": "__DEVICE__",
 			"identifiers": ["phev-__VIN__"],
 			"manufacturer": "Mitsubishi",
 			"model": "Outlander PHEV"},
 		"~": "__TOPIC__"}`,
 		"%s/binary_sensor/%s_door_boot/config": `{
 		"device_class": "door",
-		"name": "__NAME__ Boot",
+		"name": "Boot",
 		"state_topic": "~/door/boot",
 		"payload_off": "closed",
 		"payload_on": "open",
 		"avty_t": "~/available",
 		"unique_id": "__VIN___door_boot",
 		"dev": {
-			"name": "PHEV __VIN__",
+			"name": "__DEVICE__",
 			"identifiers": ["phev-__VIN__"],
 			"manufacturer": "Mitsubishi",
 			"model": "Outlander PHEV"
@@ -740,14 +800,14 @@ func (m *mqttClient) publishHomeAssistantDiscovery(vin, topic, name string) {
 		"~": "__TOPIC__"}`,
 		"%s/binary_sensor/%s_door_front_passenger/config": `{
 		"device_class": "door",
-		"name": "__NAME__ Front Passenger Door",
+		"name": "Front Passenger Door",
 		"state_topic": "~/door/front_passenger",
 		"payload_off": "closed",
 		"payload_on": "open",
 		"avty_t": "~/available",
 		"unique_id": "__VIN___door_front_passenger",
 		"dev": {
-			"name": "PHEV __VIN__",
+			"name": "__DEVICE__",
 			"identifiers": ["phev-__VIN__"],
 			"manufacturer": "Mitsubishi",
 			"model": "Outlander PHEV"
@@ -755,14 +815,14 @@ func (m *mqttClient) publishHomeAssistantDiscovery(vin, topic, name string) {
 		"~": "__TOPIC__"}`,
 		"%s/binary_sensor/%s_door_driver/config": `{
 		"device_class": "door",
-		"name": "__NAME__ Driver Door",
+		"name": "Driver Door",
 		"state_topic": "~/door/driver",
 		"payload_off": "closed",
 		"payload_on": "open",
 		"avty_t": "~/available",
 		"unique_id": "__VIN___door_driver",
 		"dev": {
-			"name": "PHEV __VIN__",
+			"name": "__DEVICE__",
 			"identifiers": ["phev-__VIN__"],
 			"manufacturer": "Mitsubishi",
 			"model": "Outlander PHEV"
@@ -770,14 +830,14 @@ func (m *mqttClient) publishHomeAssistantDiscovery(vin, topic, name string) {
 		"~": "__TOPIC__"}`,
 		"%s/binary_sensor/%s_door_rear_left/config": `{
 		"device_class": "door",
-		"name": "__NAME__ Rear Left Door",
+		"name": "Rear Left Door",
 		"state_topic": "~/door/rear_left",
 		"payload_off": "closed",
 		"payload_on": "open",
 		"avty_t": "~/available",
 		"unique_id": "__VIN___door_rear_left",
 		"dev": {
-			"name": "PHEV __VIN__",
+			"name": "__DEVICE__",
 			"identifiers": ["phev-__VIN__"],
 			"manufacturer": "Mitsubishi",
 			"model": "Outlander PHEV"
@@ -785,14 +845,14 @@ func (m *mqttClient) publishHomeAssistantDiscovery(vin, topic, name string) {
 		"~": "__TOPIC__"}`,
 		"%s/binary_sensor/%s_door_rear_right/config": `{
 		"device_class": "door",
-		"name": "__NAME__ Rear Right Door",
+		"name": "Rear Right Door",
 		"state_topic": "~/door/rear_right",
 		"payload_off": "closed",
 		"payload_on": "open",
 		"avty_t": "~/available",
 		"unique_id": "__VIN___door_rear_right",
 		"dev": {
-			"name": "PHEV __VIN__",
+			"name": "__DEVICE__",
 			"identifiers": ["phev-__VIN__"],
 			"manufacturer": "Mitsubishi",
 			"model": "Outlander PHEV"
@@ -802,27 +862,27 @@ func (m *mqttClient) publishHomeAssistantDiscovery(vin, topic, name string) {
 		// Battery and charging
 		"%s/sensor/%s_battery_level/config": `{
 		"device_class": "battery",
-		"name": "__NAME__ Battery",
+		"name": "Battery",
 		"state_topic": "~/battery/level",
 		"state_class": "measurement",
 		"unit_of_measurement": "%",
 		"avty_t": "~/available",
 		"unique_id": "__VIN___battery_level",
 		"dev": {
-			"name": "PHEV __VIN__",
+			"name": "__DEVICE__",
 			"identifiers": ["phev-__VIN__"],
 			"manufacturer": "Mitsubishi",
 			"model": "Outlander PHEV"
 		},
 		"~": "__TOPIC__"}`,
 		"%s/sensor/%s_battery_charge_remaining/config": `{
-		"name": "__NAME__ Charge Remaining",
+		"name": "Charge Remaining",
 		"state_topic": "~/charge/remaining",
 		"unit_of_measurement": "min",
 		"avty_t": "~/available",
 		"unique_id": "__VIN___battery_charge_remaining",
 		"dev": {
-			"name": "PHEV __VIN__",
+			"name": "__DEVICE__",
 			"identifiers": ["phev-__VIN__"],
 			"manufacturer": "Mitsubishi",
 			"model": "Outlander PHEV"
@@ -830,14 +890,14 @@ func (m *mqttClient) publishHomeAssistantDiscovery(vin, topic, name string) {
 		"~": "__TOPIC__"}`,
 		"%s/binary_sensor/%s_charger_connected/config": `{
 		"device_class": "plug",
-		"name": "__NAME__ Charger Connected",
+		"name": "Charger Connected",
 		"state_topic": "~/charge/plug",
 		"payload_on": "connected",
 		"payload_off": "unplugged",
 		"avty_t": "~/available",
 		"unique_id": "__VIN___charger_connected",
 		"dev": {
-			"name": "PHEV __VIN__",
+			"name": "__DEVICE__",
 			"identifiers": ["phev-__VIN__"],
 			"manufacturer": "Mitsubishi",
 			"model": "Outlander PHEV"
@@ -845,21 +905,21 @@ func (m *mqttClient) publishHomeAssistantDiscovery(vin, topic, name string) {
 		"~": "__TOPIC__"}`,
 		"%s/binary_sensor/%s_battery_charging/config": `{
 		"device_class": "battery_charging",
-		"name": "__NAME__ Charging",
+		"name": "Charging",
 		"state_topic": "~/charge/charging",
 		"payload_on": "on",
 		"payload_off": "off",
 		"avty_t": "~/available",
 		"unique_id": "__VIN___battery_charging",
 		"dev": {
-			"name": "PHEV __VIN__",
+			"name": "__DEVICE__",
 			"identifiers": ["phev-__VIN__"],
 			"manufacturer": "Mitsubishi",
 			"model": "Outlander PHEV"
 		},
 		"~": "__TOPIC__"}`,
 		"%s/switch/%s_cancel_charge_timer/config": `{
-		"name": "__NAME__ Disable Charge Timer",
+		"name": "Disable Charge Timer",
 		"icon": "mdi:timer-off",
 		"state_topic": "~/charge/charging",
 		"state_on": "on",
@@ -868,7 +928,7 @@ func (m *mqttClient) publishHomeAssistantDiscovery(vin, topic, name string) {
 		"avty_t": "~/available",
 		"unique_id": "__VIN___cancel_charge_timer",
 		"dev": {
-			"name": "PHEV __VIN__",
+			"name": "__DEVICE__",
 			"identifiers": ["phev-__VIN__"],
 			"manufacturer": "Mitsubishi",
 			"model": "Outlander PHEV"
@@ -876,7 +936,7 @@ func (m *mqttClient) publishHomeAssistantDiscovery(vin, topic, name string) {
 		"~": "__TOPIC__"}`,
 		// Climate
 		"%s/switch/%s_climate_heat/config": `{
-		"name": "__NAME__ Heat",
+		"name": "Heat",
 		"icon": "mdi:weather-sunny",
 		"state_topic": "~/climate/heat",
 		"command_topic": "~/set/climate/heat",
@@ -885,14 +945,14 @@ func (m *mqttClient) publishHomeAssistantDiscovery(vin, topic, name string) {
 		"avty_t": "~/available",
 		"unique_id": "__VIN___climate_heat",
 		"dev": {
-			"name": "PHEV __VIN__",
+			"name": "__DEVICE__",
 			"identifiers": ["phev-__VIN__"],
 			"manufacturer": "Mitsubishi",
 			"model": "Outlander PHEV"
 		},
 		"~": "__TOPIC__"}`,
 		"%s/switch/%s_climate_cool/config": `{
-		"name": "__NAME__ cool",
+		"name": "Cool",
 		"icon": "mdi:air-conditioner",
 		"state_topic": "~/climate/cool",
 		"command_topic": "~/set/climate/cool",
@@ -901,14 +961,14 @@ func (m *mqttClient) publishHomeAssistantDiscovery(vin, topic, name string) {
 		"avty_t": "~/available",
 		"unique_id": "__VIN___climate_cool",
 		"dev": {
-			"name": "PHEV __VIN__",
+			"name": "__DEVICE__",
 			"identifiers": ["phev-__VIN__"],
 			"manufacturer": "Mitsubishi",
 			"model": "Outlander PHEV"
 		},
 		"~": "__TOPIC__"}`,
 		"%s/switch/%s_climate_windscreen/config": `{
-		"name": "__NAME__ windscreen",
+		"name": "Windscreen",
 		"state_topic": "~/climate/windscreen",
 		"command_topic": "~/set/climate/windscreen",
 		"payload_off": "off",
@@ -916,7 +976,7 @@ func (m *mqttClient) publishHomeAssistantDiscovery(vin, topic, name string) {
 		"avty_t": "~/available",
 		"unique_id": "__VIN___climate_windscreen",
 		"dev": {
-			"name": "PHEV __VIN__",
+			"name": "__DEVICE__",
 			"identifiers": ["phev-__VIN__"],
 			"manufacturer": "Mitsubishi",
 			"model": "Outlander PHEV"
@@ -924,7 +984,7 @@ func (m *mqttClient) publishHomeAssistantDiscovery(vin, topic, name string) {
 		"icon": "mdi:car-defrost-front",
 		"~": "__TOPIC__"}`,
 		"%s/select/%s_climate_on/config": `{
-				"name": "__NAME__ climate state",
+				"name": "Climate state",
 				"state_topic": "~/climate/state",
 				"value_template": "{{ value if value in ['off', 'heat', 'cool', 'windscreen'] else 'off' }}",
 				"command_topic": "~/set/climate/mode",
@@ -932,7 +992,7 @@ func (m *mqttClient) publishHomeAssistantDiscovery(vin, topic, name string) {
 				"avty_t": "~/available",
 				"unique_id": "__VIN___climate_on",
 		"dev": {
-			"name": "PHEV __VIN__",
+			"name": "__DEVICE__",
 			"identifiers": ["phev-__VIN__"],
 			"manufacturer": "Mitsubishi",
 			"model": "Outlander PHEV"
@@ -941,7 +1001,7 @@ func (m *mqttClient) publishHomeAssistantDiscovery(vin, topic, name string) {
 				"~": "__TOPIC__"}`,
 		// Lights.
 		"%s/light/%s_parkinglights/config": `{
-		"name": "__NAME__ Park Lights",
+		"name": "Park Lights",
 		"icon": "mdi:car-parking-lights",
 		"state_topic": "~/lights/parking",
 		"command_topic": "~/set/parkinglights",
@@ -950,14 +1010,14 @@ func (m *mqttClient) publishHomeAssistantDiscovery(vin, topic, name string) {
 		"avty_t": "~/available",
 		"unique_id": "__VIN___parkinglights",
 		"dev": {
-			"name": "PHEV __VIN__",
+			"name": "__DEVICE__",
 			"identifiers": ["phev-__VIN__"],
 			"manufacturer": "Mitsubishi",
 			"model": "Outlander PHEV"
 		},
 		"~": "__TOPIC__"}`,
 		"%s/light/%s_headlights/config": `{
-		"name": "__NAME__ Head Lights",
+		"name": "Head Lights",
 		"icon": "mdi:car-light-dimmed",
 		"state_topic": "~/lights/head",
 		"command_topic": "~/set/headlights",
@@ -966,7 +1026,7 @@ func (m *mqttClient) publishHomeAssistantDiscovery(vin, topic, name string) {
 		"avty_t": "~/available",
 		"unique_id": "__VIN___headlights",
 		"dev": {
-			"name": "PHEV __VIN__",
+			"name": "__DEVICE__",
 			"identifiers": ["phev-__VIN__"],
 			"manufacturer": "Mitsubishi",
 			"model": "Outlander PHEV"
@@ -974,7 +1034,7 @@ func (m *mqttClient) publishHomeAssistantDiscovery(vin, topic, name string) {
 		"~": "__TOPIC__"}`,
 		"%s/binary_sensor/%s_interiorlights/config": `{
 		"device_class": "light",
-		"name": "__NAME__ Interior Lights",
+		"name": "Interior Lights",
 		"icon": "mdi:lightbulb",
 		"state_topic": "~/lights/interior",
 		"payload_off": "off",
@@ -982,7 +1042,7 @@ func (m *mqttClient) publishHomeAssistantDiscovery(vin, topic, name string) {
 		"avty_t": "~/available",
 		"unique_id": "__VIN___interiorlights",
 		"dev": {
-			"name": "PHEV __VIN__",
+			"name": "__DEVICE__",
 			"identifiers": ["phev-__VIN__"],
 			"manufacturer": "Mitsubishi",
 			"model": "Outlander PHEV"
@@ -990,7 +1050,7 @@ func (m *mqttClient) publishHomeAssistantDiscovery(vin, topic, name string) {
 		"~": "__TOPIC__"}`,
 		"%s/binary_sensor/%s_hazardlights/config": `{
 		"device_class": "light",
-		"name": "__NAME__ Hazard Lights",
+		"name": "Hazard Lights",
 		"icon": "mdi:hazard-lights",
 		"state_topic": "~/lights/hazard",
 		"payload_off": "off",
@@ -998,32 +1058,124 @@ func (m *mqttClient) publishHomeAssistantDiscovery(vin, topic, name string) {
 		"avty_t": "~/available",
 		"unique_id": "__VIN___hazardlights",
 		"dev": {
-			"name": "PHEV __VIN__",
+			"name": "__DEVICE__",
+			"identifiers": ["phev-__VIN__"],
+			"manufacturer": "Mitsubishi",
+			"model": "Outlander PHEV"
+		},
+		"~": "__TOPIC__"}`,
+		// Connection. Without avty_t: these must show the car being away,
+		// not turn unavailable.
+		"%s/binary_sensor/%s_connection/config": `{
+		"device_class": "connectivity",
+		"name": "Connection",
+		"state_topic": "~/available",
+		"payload_on": "online",
+		"payload_off": "offline",
+		"unique_id": "__VIN___connection",
+		"dev": {
+			"name": "__DEVICE__",
+			"identifiers": ["phev-__VIN__"],
+			"manufacturer": "Mitsubishi",
+			"model": "Outlander PHEV"
+		},
+		"~": "__TOPIC__"}`,
+		"%s/binary_sensor/%s_wifi/config": `{
+		"device_class": "connectivity",
+		"name": "WiFi",
+		"state_topic": "~/wifi/state",
+		"payload_on": "connected",
+		"payload_off": "disconnected",
+		"entity_category": "diagnostic",
+		"unique_id": "__VIN___wifi",
+		"dev": {
+			"name": "__DEVICE__",
+			"identifiers": ["phev-__VIN__"],
+			"manufacturer": "Mitsubishi",
+			"model": "Outlander PHEV"
+		},
+		"~": "__TOPIC__"}`,
+		"%s/sensor/%s_wifi_signal/config": `{
+		"device_class": "signal_strength",
+		"name": "WiFi signal",
+		"state_topic": "~/wifi/signal",
+		"unit_of_measurement": "dBm",
+		"state_class": "measurement",
+		"avty_t": "~/wifi/state",
+		"payload_available": "connected",
+		"payload_not_available": "disconnected",
+		"entity_category": "diagnostic",
+		"unique_id": "__VIN___wifi_signal",
+		"dev": {
+			"name": "__DEVICE__",
+			"identifiers": ["phev-__VIN__"],
+			"manufacturer": "Mitsubishi",
+			"model": "Outlander PHEV"
+		},
+		"~": "__TOPIC__"}`,
+		"%s/sensor/%s_last_connected/config": `{
+		"device_class": "timestamp",
+		"name": "Last connected",
+		"state_topic": "~/connection/last_connected",
+		"entity_category": "diagnostic",
+		"unique_id": "__VIN___last_connected",
+		"dev": {
+			"name": "__DEVICE__",
+			"identifiers": ["phev-__VIN__"],
+			"manufacturer": "Mitsubishi",
+			"model": "Outlander PHEV"
+		},
+		"~": "__TOPIC__"}`,
+		"%s/sensor/%s_last_disconnected/config": `{
+		"device_class": "timestamp",
+		"name": "Last disconnected",
+		"state_topic": "~/connection/last_disconnected",
+		"entity_category": "diagnostic",
+		"unique_id": "__VIN___last_disconnected",
+		"dev": {
+			"name": "__DEVICE__",
 			"identifiers": ["phev-__VIN__"],
 			"manufacturer": "Mitsubishi",
 			"model": "Outlander PHEV"
 		},
 		"~": "__TOPIC__"}`,
 		// General topics.
+		// Without avty_t: the gateway can restart while the car is away.
+		"%s/button/%s_restart/config": `{
+		"device_class": "restart",
+		"name": "Restart gateway",
+		"command_topic": "~/restart",
+		"payload_press": "restart",
+		"entity_category": "config",
+		"unique_id": "__VIN___restart",
+		"dev": {
+			"name": "__DEVICE__",
+			"identifiers": ["phev-__VIN__"],
+			"manufacturer": "Mitsubishi",
+			"model": "Outlander PHEV"
+		},
+		"~": "__TOPIC__"}`,
 		"%s/button/%s_reconnect_wifi/config": `{
-		"name": "__NAME__ Restart Wifi connetion",
-		"icon": "mdi:timer-off",
+		"name": "Reconnect to car",
+		"icon": "mdi:car-connected",
 		"command_topic": "~/connection",
 		"payload_press": "restart",
 		"avty_t": "~/available",
 		"unique_id": "__VIN___restart_wifi",
 		"dev": {
-			"name": "PHEV __VIN__",
+			"name": "__DEVICE__",
 			"identifiers": ["phev-__VIN__"],
 			"manufacturer": "Mitsubishi",
 			"model": "Outlander PHEV"
 		},
 		"~": "__TOPIC__"}`,
 	}
+	// Entity names go without the device name: Home Assistant puts it in
+	// front of them itself.
 	mappings := map[string]string{
-		"__NAME__":  name,
-		"__VIN__":   vin,
-		"__TOPIC__": topic,
+		"__DEVICE__": jsonString(device),
+		"__VIN__":    vin,
+		"__TOPIC__":  topic,
 	}
 	for topic, d := range discoveryData {
 		topic = fmt.Sprintf(topic, discoveryPrefix, vin)
@@ -1053,11 +1205,12 @@ func init() {
 	mqttCmd.Flags().Bool("mqtt_disable_register_set_command", false, "Disable vechicle register setting via MQTT")
 	mqttCmd.Flags().Bool("ha_discovery", true, "Enable Home Assistant MQTT discovery")
 	mqttCmd.Flags().String("ha_discovery_prefix", "homeassistant", "Prefix for Home Assistant MQTT discovery")
+	mqttCmd.Flags().String("ha_device_name", "", "Name of the car in Home Assistant (default PHEV <VIN>)")
 	mqttCmd.Flags().Duration("update_interval", 5*time.Minute, "How often to request force updates")
 	mqttCmd.Flags().Duration("wifi_restart_time", 0, "Attempt to restart Wifi if no connection for this long")
 	mqttCmd.Flags().Duration("wifi_restart_retry_time", 2*time.Minute, "Interval to attempt Wifi restart")
 	mqttCmd.Flags().String("wifi_restart_command", defaultWifiRestartCmd, "Command to restart Wifi connection to Phev")
-	mqttCmd.Flags().String("wifi_interface", "wlan0", "WiFi interface for the car, as managed by the web interface")
+	mqttCmd.Flags().String("wifi_interface", "wlan0", "WiFi interface for the car: its state goes to MQTT, and the web interface manages it")
 	// web_password and web_settings_file only come from the config file, so
 	// the password never shows up in the process list.
 	mqttCmd.Flags().String("web_listen", "", "Serve the web interface on this address, e.g. 127.0.0.1:8080 (off if empty)")
@@ -1069,6 +1222,7 @@ func init() {
 	viper.BindPFlag("mqtt_disable_register_set_command", mqttCmd.Flags().Lookup("mqtt_disable_register_set_command"))
 	viper.BindPFlag("ha_discovery", mqttCmd.Flags().Lookup("ha_discovery"))
 	viper.BindPFlag("ha_discovery_prefix", mqttCmd.Flags().Lookup("ha_discovery_prefix"))
+	viper.BindPFlag("ha_device_name", mqttCmd.Flags().Lookup("ha_device_name"))
 	viper.BindPFlag("update_interval", mqttCmd.Flags().Lookup("update_interval"))
 	viper.BindPFlag("wifi_interface", mqttCmd.Flags().Lookup("wifi_interface"))
 	viper.BindPFlag("web_listen", mqttCmd.Flags().Lookup("web_listen"))
