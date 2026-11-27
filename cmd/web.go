@@ -156,6 +156,8 @@ type webState struct {
 	Build         string `json:"build"`
 	// climate_guard is on: show its last result, also before the first.
 	ClimateGuard bool `json:"climate_guard"`
+	// extra_commands is on: show its buttons and their last result.
+	ExtraCommands bool `json:"extra_commands"`
 }
 
 func (ws *webServer) currentState() webState {
@@ -166,6 +168,7 @@ func (ws *webServer) currentState() webState {
 		Version:       releaseVersion(),
 		Build:         Version,
 		ClimateGuard:  ws.m.climateGuard,
+		ExtraCommands: ws.m.extraCommands,
 	}
 }
 
@@ -230,6 +233,7 @@ var webCommands = map[string]webCommand{
 	"climate_windscreen": {"/set/climate/windscreen", []string{"10", "20", "30"}},
 	"climate_off":        {"/set/climate/mode", []string{"off"}},
 	"climate_reset":      {"/set/climate/state", []string{"reset"}},
+	"sync_clock":         {"/set/sync_clock", []string{""}},
 	"connection":         {"/connection", []string{"on", "off", "restart"}},
 }
 
@@ -249,11 +253,7 @@ func (ws *webServer) command(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusConflict, errors.New("not connected to the car"))
 			return
 		}
-		go func() {
-			if err := phev.SetRegister(0x6, []byte{0x3}); err != nil {
-				log.Infof("Error requesting update: %v", err)
-			}
-		}()
+		go requestUpdate(phev)
 	case "restart":
 		log.Info("Web interface: restart")
 		go func() {

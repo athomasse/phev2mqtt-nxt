@@ -16,11 +16,13 @@ over the car's own WiFi. A fork of [buxtronix/phev2mqtt](https://github.com/buxt
  * Pre-heats or cools the car, switches the lights and cancels the charge timer;
    optionally like the official app, keeping the car's own climate timers and reporting
    whether the climate really started (`climate_guard`)
+ * Shows how far the car's clock is off, and sets it with a button (`extra_commands`)
  * Optionally recovers from the car rejecting the encryption without reconnecting
    (`key_resync`)
  * Tells you whether the car is connected, how strong its WiFi is, and when it last
    connected
- * Has a web interface for the status, the controls, the setup and the log
+ * Has a web interface for the status, the controls, the setup and the log; every button
+   in it is also a Home Assistant button and an MQTT topic
 
 Tested on an Outlander PHEV MY14 and MY18 and an Eclipse Cross (2022).
 
@@ -30,7 +32,7 @@ On a Raspberry Pi (any model) or another machine with Debian, Ubuntu or Raspberr
 and a WiFi adapter within reach of the car:
 
 ```
-version=0.6.2
+version=0.7.0
 deb=phev2mqtt_${version}_$(dpkg --print-architecture).deb
 base=https://github.com/athomasse/phev2mqtt-nxt/releases/download/v$version
 curl -fLO "$base/SHA256SUMS" -fLO "$base/$deb"
@@ -89,6 +91,8 @@ and more), set `extra_sensors: true`; they are best known for 2014-2017 cars.
 reconnecting, and `climate_guard: true` starts the climate like the official app:
 it keeps the car's own climate timers (2014-2017 cars), refuses while the car is
 switched on or quick charging, and reports whether the climate really started.
+`extra_commands: true` adds a Sync Car Clock button (Home Assistant and web
+interface, or `phev/set/sync_clock`), which sets the car's clock to the gateway's.
 
 All settings, with comments, are in `/etc/phev2mqtt/config.yaml`; the log is in
 `journalctl -u phev2mqtt` and in the web interface.
@@ -129,7 +133,7 @@ Published, under the prefix `phev` (`mqtt_topic_prefix`):
 | phev/charge/timer, timer_waiting, timer_failed, timer_schedule | With `extra_sensors`: the car's own charge timer *on*/*off*, waiting for it, a scheduled charge that failed, and its windows per day (JSON) |
 | phev/climate/timer, timer_schedule | With `extra_sensors`: the car's own climate timer *on*/*off*, and its start time per day (JSON) |
 | phev/battery/heater, too_cold | With `extra_sensors`: battery heater on (2014-2017 cars), and the car asking for the cable because the battery is too cold |
-| phev/command/result | With `climate_guard`: the result of the last climate command, e.g. *2026-11-25 07:30 Heat 20 min: done, the climate is running* |
+| phev/command/result | With `climate_guard` or `extra_commands`: the result of the last command, e.g. *2026-11-25 07:30 Heat 20 min: done, the climate is running* |
 | phev/car/ev_ecu_error, screen_in_use, registration_standby, clock, clock_offset | With `extra_sensors`: EV-ECU communication error, the car's own screen in use, registration mode, the car's clock, and how many seconds it is ahead (+) of or behind (-) the gateway's clock |
 | phev/register/[register] | Raw register values, in hex |
 
@@ -141,8 +145,12 @@ Commands:
 | phev/set/climate/mode | *off* |
 | phev/set/headlights, parkinglights | *on* or *off* |
 | phev/set/cancelchargetimer | Anything |
+| phev/set/climate/state | *reset*: clears the *terminated* climate state |
+| phev/set/refresh | Anything: asks the car for all its values now |
+| phev/set/sync_clock | With `extra_commands`: anything, sets the car's clock to the gateway's |
 | phev/connection | *on*, *off* or *restart* (reconnect to the car) |
 | phev/restart | Anything: restarts phev2mqtt |
+| phev/wifi/restart | Anything: runs `wifi_restart_command`, also without the car |
 | phev/set/register/[register] | A raw register value, in hex |
 
 </details>
@@ -166,7 +174,7 @@ It was inspired by [phev-remote](https://github.com/phev-remote) by
 [@papawattu](https://github.com/papawattu).
 
 The extra sensors (`extra_sensors`), the key resync (`key_resync`), the climate
-guard (`climate_guard`) and the Charger Connected and Interior Lights decoding come
+guard (`climate_guard`), the clock sync (`extra_commands`) and the Charger Connected and Interior Lights decoding come
 from [@corautem](https://github.com/corautem)'s
 [fork](https://github.com/corautem/phev2mqtt), which adapted them from
 **PHEV Link** ([Anwo91/phev-remote-plus](https://github.com/Anwo91/phev-remote-plus)),
@@ -178,7 +186,7 @@ is from PHEV Link's source as published on 14 October 2026, before version 1.0.9
 under the GNU General Public License version 3 or later; nothing from its later,
 proprietary versions is used. The files concerned (`protocol/status.go`,
 `protocol/status_test.go`, `protocol/message.go`, `protocol/raw.go`,
-`client/client.go`, `cmd/climate_guard.go`) say so in their comments.
+`client/client.go`, `cmd/climate_guard.go`, `cmd/commands.go`) say so in their comments.
 
 This fork is maintained by Andre Thomasse ([@athomasse](https://github.com/athomasse)).
 Issues and pull requests are welcome.

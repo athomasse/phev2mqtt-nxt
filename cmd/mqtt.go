@@ -125,6 +125,17 @@ func restartWifi(cmd *cobra.Command) error {
 
 // runWifiRestart runs wifi_restart_command. Never for longer than a minute:
 // a hanging command would otherwise stall the car loop.
+// wifiRestartTopic runs wifi_restart_command, like the web interface's
+// Restart WiFi button.
+const wifiRestartTopic = "/wifi/restart"
+
+// requestUpdate asks the car to send all its registers.
+func requestUpdate(phev *client.Client) {
+	if err := phev.SetRegister(0x6, []byte{0x3}); err != nil {
+		log.Infof("Error requesting update: %v", err)
+	}
+}
+
 func runWifiRestart() error {
 	restartCommand := cfgString("wifi_restart_command")
 	if restartCommand == "" {
@@ -160,8 +171,10 @@ type mqttClient struct {
 	// climate_guard: the registers of the current session, and one guarded
 	// climate command at a time.
 	climateGuard bool
-	regs         regCache
-	commandMu    sync.Mutex
+	// extra_commands: buttons such as Sync Car Clock (commands.go).
+	extraCommands bool
+	regs          regCache
+	commandMu     sync.Mutex
 
 	// Shared with the MQTT callbacks and the web interface.
 	state *gatewayState
@@ -256,7 +269,7 @@ func (m *mqttClient) connectMQTT() {
 	// (re)connection - a broker restart silently drops both.
 	onConnect := func(mqtt_client mqtt.Client) {
 		log.Info("Connected to MQTT broker")
-		topics := []string{m.topic("/connection"), m.topic("/restart"), m.topic("/settings/#"), m.haStatusTopic()}
+		topics := []string{m.topic("/connection"), m.topic("/restart"), m.topic(wifiRestartTopic), m.topic("/settings/#"), m.haStatusTopic()}
 		if !disableSet {
 			topics = append(topics, m.topic("/set/#"))
 		}
@@ -328,6 +341,7 @@ func (m *mqttClient) Run(cmd *cobra.Command, args []string) error {
 	m.wifiIface = cfgString("wifi_interface")
 	m.extraSensors = cfgBool("extra_sensors")
 	m.climateGuard = cfgBool("climate_guard")
+	m.extraCommands = cfgBool("extra_commands")
 	m.wifi = &wifiManager{iface: m.wifiIface}
 	carReconnect := m.wifiIface != "" && nmcliAvailable()
 	if m.wifiIface != "" && !carReconnect {
@@ -441,7 +455,7 @@ func (m *mqttClient) handleIncomingMqtt(mqtt_client mqtt.Client, msg mqtt.Messag
 	// it on every connection attempt.
 	phev := m.state.car()
 	haStatus := m.haStatusTopic()
-	if phev == nil && msg.Topic() != haStatus && msg.Topic() != m.topic("/connection") && msg.Topic() != m.topic("/restart") {
+	if phev == nil && msg.Topic() != haStatus && msg.Topic() != m.topic("/connection") && msg.Topic() != m.topic("/restart") && msg.Topic() != m.topic(wifiRestartTopic) {
 		log.Infof("Not connected to the car yet, ignoring [%s]", msg.Topic())
 		return
 	}
@@ -465,6 +479,22 @@ func (m *mqttClient) handleIncomingMqtt(mqtt_client mqtt.Client, msg mqtt.Messag
 		}
 		// Not in this callback: restart waits for the broker.
 		go m.restart()
+	} else if msg.Topic() == m.topic(wifiRestartTopic) {
+		// Works without the car: that is when it is needed.
+		if msg.Retained() {
+			log.Warnf("Ignoring retained [%s]; clear it on the broker", msg.Topic())
+			return
+		}
+		go func() {
+			if err := runWifiRestart(); err != nil {
+				log.Errorf("Error restarting wifi: %v", err)
+			}
+		}()
+	} else if msg.Topic() == m.topic("/set/refresh") {
+		if msg.Retained() {
+			return
+		}
+		go requestUpdate(phev)
 	} else if strings.HasPrefix(msg.Topic(), m.topic("/set/register/")) {
 		// Strip the prefix instead of splitting the whole topic: the prefix
 		// itself may contain slashes (e.g. "home/phev").
@@ -500,6 +530,13 @@ func (m *mqttClient) handleIncomingMqtt(mqtt_client mqtt.Client, msg mqtt.Messag
 				phev.Close()
 			}
 		}
+	} else if msg.Topic() == m.topic("/set/sync_clock") {
+		if !m.extraCommands || msg.Retained() {
+			// A retained command would set the clock on every connect.
+			log.Infof("Ignoring %s: extra_commands is off, or the message is retained", msg.Topic())
+			return
+		}
+		go m.syncClock(phev)
 	} else if msg.Topic() == m.topic("/set/parkinglights") {
 		values := map[string]byte{"on": 0x1, "off": 0x2}
 		if v, ok := values[strings.ToLower(string(msg.Payload()))]; ok {
@@ -1241,6 +1278,49 @@ func (m *mqttClient) publishHomeAssistantDiscovery(vin, topic string) {
 			"model": "Outlander PHEV"
 		},
 		"~": "__TOPIC__"}`,
+		"%s/button/%s_restart_wifi_interface/config": `{
+		"name": "Restart WiFi",
+		"icon": "mdi:wifi-refresh",
+		"command_topic": "~/wifi/restart",
+		"entity_category": "config",
+		"avty_t": "~/gateway/available",
+		"unique_id": "__VIN___restart_wifi_interface",
+		"dev": {
+			"name": "__DEVICE__",
+			"identifiers": ["phev-__VIN__"],
+			"manufacturer": "Mitsubishi",
+			"model": "Outlander PHEV"
+		},
+		"~": "__TOPIC__"}`,
+		"%s/button/%s_refresh/config": `{
+		"name": "Refresh",
+		"icon": "mdi:refresh",
+		"command_topic": "~/set/refresh",
+		"availability": [{"topic": "~/gateway/available"}, {"topic": "~/available"}],
+		"availability_mode": "all",
+		"unique_id": "__VIN___refresh",
+		"dev": {
+			"name": "__DEVICE__",
+			"identifiers": ["phev-__VIN__"],
+			"manufacturer": "Mitsubishi",
+			"model": "Outlander PHEV"
+		},
+		"~": "__TOPIC__"}`,
+		"%s/button/%s_climate_clear_terminated/config": `{
+		"name": "Clear Climate Terminated",
+		"icon": "mdi:fan-alert",
+		"command_topic": "~/set/climate/state",
+		"payload_press": "reset",
+		"availability": [{"topic": "~/gateway/available"}, {"topic": "~/available"}],
+		"availability_mode": "all",
+		"unique_id": "__VIN___climate_clear_terminated",
+		"dev": {
+			"name": "__DEVICE__",
+			"identifiers": ["phev-__VIN__"],
+			"manufacturer": "Mitsubishi",
+			"model": "Outlander PHEV"
+		},
+		"~": "__TOPIC__"}`,
 		"%s/button/%s_reconnect_wifi/config": `{
 		"name": "Reconnect to car",
 		"icon": "mdi:car-connected",
@@ -1257,7 +1337,8 @@ func (m *mqttClient) publishHomeAssistantDiscovery(vin, topic string) {
 		"~": "__TOPIC__"}`,
 	}
 	addExtraSensorDiscovery(discoveryData, m.extraSensors)
-	addDiscovery(discoveryData, climateGuardEntities, m.climateGuard)
+	addDiscovery(discoveryData, commandResultEntities, m.climateGuard || m.extraCommands)
+	addDiscovery(discoveryData, extraCommandEntities, m.extraCommands)
 	// Entity names go without the device name: Home Assistant puts it in
 	// front of them itself.
 	mappings := map[string]string{
@@ -1304,6 +1385,7 @@ func init() {
 	mqttCmd.Flags().String("web_listen", "", "Serve the web interface on this address, e.g. 127.0.0.1:8080 (off if empty)")
 	mqttCmd.Flags().Bool("key_resync", false, "Recover from the car's encoding complaints: resync to the key it expects, cap resends, ask for a new key")
 	mqttCmd.Flags().Bool("climate_guard", false, "Start the climate like the official app: keep the car's climate timers, refuse when it can't run, confirm it started")
+	mqttCmd.Flags().Bool("extra_commands", false, "Extra command buttons (Sync Car Clock), with their results in phev/command/result")
 	mqttCmd.Flags().Bool("extra_sensors", false, "Publish extra status sensors: ignition, charge type, the car's timers, battery heater, ...")
 
 	viper.BindPFlag("mqtt_server", mqttCmd.Flags().Lookup("mqtt_server"))
@@ -1320,6 +1402,7 @@ func init() {
 	viper.BindPFlag("extra_sensors", mqttCmd.Flags().Lookup("extra_sensors"))
 	viper.BindPFlag("key_resync", mqttCmd.Flags().Lookup("key_resync"))
 	viper.BindPFlag("climate_guard", mqttCmd.Flags().Lookup("climate_guard"))
+	viper.BindPFlag("extra_commands", mqttCmd.Flags().Lookup("extra_commands"))
 	// Config file only, like web_password; turning the login off must be a
 	// deliberate choice.
 	viper.SetDefault("web_auth", true)
