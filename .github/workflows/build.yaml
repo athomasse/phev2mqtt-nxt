@@ -39,7 +39,11 @@ jobs:
       # so `decode pcap` cannot rot unnoticed.
       - name: Build with the pcap tag
         run: |
-          sudo apt-get update && sudo apt-get install -y libpcap-dev
+          # A broken third-party repo on the runner image (e.g. a 403 from
+          # packages.microsoft.com) must not stop the Ubuntu one: install
+          # fails anyway if libpcap-dev can't be fetched.
+          sudo apt-get update || true
+          sudo apt-get install -y libpcap-dev
           go vet -tags pcap ./...
           go build -tags pcap -o /dev/null .
 
